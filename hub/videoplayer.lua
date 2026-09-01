@@ -79,24 +79,23 @@ local function formatTime(seconds)
     return ("%d:%02d"):format(m, s)
 end
 
--- Two-row touch control bar: row h-1 is info text (elapsed/volume%/
--- remaining), row h is real buttons with known hit-test rectangles. This
--- screen draws the whole video frame with raw mon.blit every frame (like
--- the main menu's matrix rain, at a much higher redraw rate), so it can't
--- use Basalt here the same way the music player does -- Basalt only
--- repaints on property changes, and a full-screen redraw every frame would
--- either fight it or get overdrawn by it. Buttons are just drawn rectangles
--- + monitor_touch hit-testing, computed fresh each call and reused by the
--- input handler below.
-local function buildButtonLayout(w, h)
-    local labels = { "Pause", "Stop", "-10%", "-1%", "+1%", "+10%" }
-    local n = #labels
+-- ONE line, black background: elapsed time on the left, small buttons in
+-- the middle, remaining time on the right. This screen draws the whole
+-- video frame with raw mon.blit every frame (like the main menu's matrix
+-- rain, at a much higher redraw rate), so it can't use Basalt here the way
+-- the music player does -- Basalt only repaints on property changes, and a
+-- full-screen redraw every frame would either fight it or get overdrawn by
+-- it. Buttons are just drawn rectangles + monitor_touch hit-testing,
+-- computed fresh each call and reused by the input handler below.
+local BUTTON_LABELS = { "||", "X", "<<", "<", ">", ">>" } -- pause/play, stop, -10%, -1%, +1%, +10%
+local function buildButtonLayout(w, h, centerX)
+    local n = #BUTTON_LABELS
+    local btnW = 3
     local gap = 1
-    local btnW = math.max(4, math.floor((w - gap * (n - 1)) / n))
     local totalW = btnW * n + gap * (n - 1)
-    local startX = math.max(1, math.floor((w - totalW) / 2) + 1)
+    local startX = math.max(1, centerX - math.floor(totalW / 2))
     local buttons = {}
-    for i, label in ipairs(labels) do
+    for i, label in ipairs(BUTTON_LABELS) do
         local x1 = startX + (i - 1) * (btnW + gap)
         buttons[i] = { label = label, x1 = x1, x2 = x1 + btnW - 1, y = h, w = btnW }
     end
@@ -108,36 +107,27 @@ local function drawControls(mon, w, h, state, totalDurationSec, buttons)
     local remaining = math.max(0, totalDurationSec - elapsed)
     local pct = math.floor(state.volume / state.maxVolume * 100 + 0.5)
 
-    -- Row h-1: elapsed left / volume% center / remaining right, same
-    -- layout as the original (pre-touch) control bar.
-    mon.setBackgroundColor(colors.gray)
-    mon.setTextColor(colors.white)
-    mon.setCursorPos(1, h - 1)
-    mon.clearLine()
-    local playIcon = state.paused and "||" or ">"
-    local left = (" %s %s"):format(playIcon, formatTime(elapsed))
-    local right = ("-%s "):format(formatTime(remaining))
-    local volText = ("Vol %d%%"):format(pct)
-    mon.setCursorPos(1, h - 1)
-    mon.write(left)
-    mon.setCursorPos(w - #right + 1, h - 1)
-    mon.write(right)
-    mon.setCursorPos(math.max(#left + 2, math.floor((w - #volText) / 2) + 1), h - 1)
-    mon.write(volText)
-
-    -- Row h: buttons only, black background.
     mon.setBackgroundColor(colors.black)
     mon.setCursorPos(1, h)
     mon.clearLine()
+
+    local playIcon = state.paused and ">" or "||"
+    local left = (" %s %s"):format(playIcon, formatTime(elapsed))
+    local right = ("%d%% -%s "):format(pct, formatTime(remaining))
+
+    mon.setTextColor(colors.white)
+    mon.setCursorPos(1, h)
+    mon.write(left)
+    mon.setCursorPos(w - #right + 1, h)
+    mon.write(right)
+
     for i, btn in ipairs(buttons) do
-        local label = (i == 1 and state.paused) and "Play" or btn.label
+        local label = (i == 1 and state.paused) and ">" or btn.label
         mon.setCursorPos(btn.x1, btn.y)
-        mon.setBackgroundColor(colors.black)
         mon.setTextColor(i == 2 and colors.red or colors.lime)
-        local text = label
-        local pad = btn.w - #text
+        local pad = btn.w - #label
         local leftPad = math.floor(pad / 2)
-        mon.write((" "):rep(math.max(0, leftPad)) .. text .. (" "):rep(math.max(0, pad - leftPad)))
+        mon.write((" "):rep(math.max(0, leftPad)) .. label .. (" "):rep(math.max(0, pad - leftPad)))
     end
 
     mon.setBackgroundColor(colors.black)
@@ -227,7 +217,7 @@ function M.play(mon, speakers, entry, config)
 
         local fps = decoded.fps
         local nFrames = #decoded.video
-        local buttons = buildButtonLayout(w, h)
+        local buttons = buildButtonLayout(w, h, math.floor(w / 2) + 1)
 
         local function saveVolume()
             savedSettings.videoVolume = state.volume
@@ -265,38 +255,43 @@ function M.play(mon, speakers, entry, config)
                     end
                     cumulativeSec = cumulativeSec + nFrames / fps
                 end,
-                function() -- audio, paced by wall-clock time, fanned out to every speaker
-                    -- Fire-and-forget to every networked speaker at the
-                    -- correct REAL TIME moment, instead of the previous
-                    -- design where each speaker independently waited for
-                    -- its own speaker_audio_empty acknowledgment before
-                    -- advancing. Each speaker.playAudio call and its "done"
-                    -- signal is a real network round-trip -- with dozens of
-                    -- networked speakers (confirmed: this installation has
-                    -- that many) all being fed this way, that per-call
-                    -- latency compounded independently per speaker and the
-                    -- whole mix drifted further out of sync the longer
-                    -- playback ran (confirmed in-game). Pacing dispatch
-                    -- against a wall clock instead of per-speaker feedback
-                    -- removes that compounding entirely: if one speaker's
-                    -- buffer is still busy when its turn comes, that one
-                    -- chunk is just dropped for that speaker (a small
-                    -- glitch) rather than the whole video waiting on it.
+                function() -- audio, fanned out to every networked speaker
+                    -- REVERTED the wall-clock fire-and-forget version --
+                    -- confirmed in-game it made actual sound quality worse
+                    -- ("first time... sound played properly", this one
+                    -- didn't), because dropping any chunk a speaker's
+                    -- buffer wasn't immediately ready for is a real
+                    -- correctness cost, not a minor one. Back to each
+                    -- speaker waiting for its own real
+                    -- speaker_audio_empty acknowledgment (the version that
+                    -- actually sounded right), but STILL with the 3s
+                    -- per-speaker timeout from before so one dead speaker
+                    -- among the many networked ones can't freeze the
+                    -- whole video again either.
                     if not decoded.audio or #speakers == 0 then return end
-                    local audioStart = os.epoch("utc")
-                    for i, chunk in ipairs(decoded.audio) do
-                        if state.stopRequested then break end
-                        for _, speaker in ipairs(speakers) do
-                            pcall(speaker.playAudio, chunk, state.volume)
-                        end
-                        -- Each decoded audio chunk is ~1 real second
-                        -- (DFPWM: 6000 bytes/sec post-decode; raw PCM:
-                        -- 48000 bytes/sec), so the i-th chunk should start
-                        -- at audioStart + i seconds.
-                        while not state.stopRequested and os.epoch("utc") < audioStart + i * 1000 do
-                            os.sleep(0.05)
+                    local funcs = {}
+                    for _, speaker in ipairs(speakers) do
+                        funcs[#funcs + 1] = function()
+                            for _, chunk in ipairs(decoded.audio) do
+                                if state.stopRequested then break end
+                                while not state.stopRequested and not speaker.playAudio(chunk, state.volume) do
+                                    local timerId = os.startTimer(3)
+                                    local gaveUp = false
+                                    repeat
+                                        local ev, a, b = os.pullEvent()
+                                        if ev == "speaker_audio_empty" and a == peripheral.getName(speaker) then
+                                            break
+                                        elseif ev == "timer" and a == timerId then
+                                            gaveUp = true
+                                            break
+                                        end
+                                    until state.stopRequested
+                                    if gaveUp or state.stopRequested then break end
+                                end
+                            end
                         end
                     end
+                    parallel.waitForAll(table.unpack(funcs))
                 end,
                 function() -- input handling: keyboard (at the Computer) and touch (at the monitor)
                     while not state.stopRequested do
