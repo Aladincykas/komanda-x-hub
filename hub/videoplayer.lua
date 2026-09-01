@@ -1,0 +1,216 @@
+-- videoplayer.lua -- full-screen 32vid playback on the wrapped monitor,
+-- with a bottom control bar (play/pause, elapsed/remaining, volume) laid
+-- over the video, chaining through a video's chunk list fetched from
+-- raw.githubusercontent.com. Uses hub/vendor/32vid-decode.lua (a lightly
+-- adapted copy of sanjuuni's own player) for the actual frame decoding --
+-- see that file's header comment before touching the decode logic.
+
+local decodeModule = require("vendor.32vid-decode")
+
+local M = {}
+
+local function drawLoading(mon, w, h, text)
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    mon.setTextColor(colors.white)
+    local x = math.max(1, math.floor((w - #text) / 2) + 1)
+    mon.setCursorPos(x, math.floor(h / 2))
+    mon.write(text)
+end
+
+local function fetchChunkToTemp(url)
+    local cacheBustUrl = url .. (url:find("?") and "&" or "?") .. "t=" .. tostring(os.epoch("utc"))
+    local response, err = http.get(cacheBustUrl, nil, true)
+    if not response then
+        error("Failed to download video chunk: " .. tostring(err))
+    end
+    local body = response.readAll()
+    response.close()
+
+    local tmpPath = "video_chunk_" .. tostring(os.epoch("utc")) .. ".32vid"
+    local f = fs.open(tmpPath, "wb")
+    if not f then error("Could not open temp file for video chunk") end
+    f.write(body)
+    f.close()
+    return tmpPath
+end
+
+local function formatTime(seconds)
+    if seconds < 0 then seconds = 0 end
+    seconds = math.floor(seconds)
+    local m = math.floor(seconds / 60)
+    local s = seconds % 60
+    return ("%d:%02d"):format(m, s)
+end
+
+-- Draws the bottom control bar on top of whatever frame is currently shown.
+local function drawControls(mon, w, h, state, totalDurationSec)
+    local elapsed = state.elapsedSec
+    local remaining = math.max(0, totalDurationSec - elapsed)
+
+    mon.setBackgroundColor(colors.gray)
+    mon.setTextColor(colors.white)
+    mon.setCursorPos(1, h)
+    mon.clearLine()
+
+    local playIcon = state.paused and "||" or ">"
+    local left = (" %s %s"):format(playIcon, formatTime(elapsed))
+    local right = ("-%s "):format(formatTime(remaining))
+    local volSegments = 8
+    local filled = math.max(0, math.min(volSegments, math.floor((state.volume / state.maxVolume) * volSegments + 0.5)))
+    local volBar = ("Vol[" .. ("#"):rep(filled) .. ("-"):rep(volSegments - filled) .. ("%3d%%"):format(math.floor(state.volume / state.maxVolume * 100 + 0.5)) .. "]")
+
+    mon.setCursorPos(1, h)
+    mon.write(left)
+    mon.setCursorPos(w - #right + 1, h)
+    mon.write(right)
+    local volX = math.max(#left + 2, math.floor((w - #volBar) / 2) + 1)
+    mon.setCursorPos(volX, h)
+    mon.write(volBar)
+
+    mon.setBackgroundColor(colors.black)
+end
+
+local function drawFrame(mon, image)
+    for i, v in ipairs(image.palette) do
+        mon.setPaletteColor(2 ^ (i - 1), table.unpack(v))
+    end
+    for y, r in ipairs(image) do
+        mon.setCursorPos(1, y)
+        mon.blit(table.unpack(r))
+    end
+end
+
+local function resetPalette(mon)
+    for i = 0, 15 do
+        mon.setPaletteColor(2 ^ i, mon.nativePaletteColor and mon.nativePaletteColor(2 ^ i) or 0)
+    end
+end
+
+-- Plays every chunk of `entry` ({name, chunks, width, height, fps,
+-- durationSec}) in order. Returns "done" when playback finishes normally,
+-- or "stopped" if the user pressed S. Any key other than the recognized
+-- controls is ignored (there is no idle-timeout *during* playback -- only
+-- the video/music list screens time out).
+function M.play(mon, speakers, entry, config)
+    local w, h = mon.getSize()
+    local state = {
+        paused = false,
+        stopRequested = false,
+        volume = config.DEFAULT_VOLUME,
+        maxVolume = config.MAX_VOLUME,
+        elapsedSec = 0,
+    }
+
+    local cumulativeSec = 0
+    local result = "done"
+
+    for chunkIndex, url in ipairs(entry.chunks) do
+        if state.stopRequested then break end
+
+        drawLoading(mon, w, h, ("Loading %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
+
+        local tmpPath = fetchChunkToTemp(url)
+        local file = fs.open(tmpPath, "rb")
+        if not file then
+            fs.delete(tmpPath)
+            error("Could not reopen downloaded video chunk")
+        end
+
+        local ok, decoded = pcall(decodeModule.decode, file, function(i, n)
+            drawLoading(mon, w, h, ("Loading %s (part %d/%d) %d%%..."):format(entry.name, chunkIndex, #entry.chunks, math.floor(i / n * 100)))
+        end)
+        fs.delete(tmpPath)
+        if not ok then
+            drawLoading(mon, w, h, "Video decode error: " .. tostring(decoded))
+            os.sleep(2)
+            result = "done"
+            break
+        end
+
+        local fps = decoded.fps
+        local nFrames = #decoded.video
+
+        local playOk, playErr = pcall(function()
+            parallel.waitForAll(
+                function() -- video render, paced to fps
+                    local start = os.epoch("utc")
+                    local f = 1
+                    while f <= nFrames and not state.stopRequested do
+                        while state.paused and not state.stopRequested do
+                            os.pullEvent("video_control")
+                            start = os.epoch("utc") - (f - 1) / fps * 1000 -- resume timing cleanly
+                        end
+                        if state.stopRequested then break end
+
+                        drawFrame(mon, decoded.video[f])
+                        state.elapsedSec = cumulativeSec + (f - 1) / fps
+                        drawControls(mon, w, h, state, entry.durationSec or 0)
+
+                        while os.epoch("utc") < start + (f + 1) / fps * 1000 do
+                            os.sleep(1 / fps)
+                            if state.stopRequested then break end
+                        end
+                        f = f + 1
+                    end
+                    cumulativeSec = cumulativeSec + nFrames / fps
+                end,
+                function() -- audio, fanned out to every networked speaker
+                    if not decoded.audio or #speakers == 0 then return end
+                    local funcs = {}
+                    for _, speaker in ipairs(speakers) do
+                        funcs[#funcs + 1] = function()
+                            for _, chunk in ipairs(decoded.audio) do
+                                if state.stopRequested then break end
+                                while not state.stopRequested and not speaker.playAudio(chunk, state.volume) do
+                                    repeat
+                                        local ev, name = os.pullEvent("speaker_audio_empty")
+                                    until state.stopRequested or name == peripheral.getName(speaker)
+                                end
+                            end
+                        end
+                    end
+                    parallel.waitForAll(table.unpack(funcs))
+                end,
+                function() -- input handling
+                    while not state.stopRequested do
+                        local ev, key = os.pullEvent("key")
+                        if key == keys.space then
+                            state.paused = not state.paused
+                            os.queueEvent("video_control")
+                        elseif key == keys.s then
+                            state.stopRequested = true
+                            os.queueEvent("video_control")
+                        elseif key == keys.left then
+                            state.volume = math.max(0, math.floor((state.volume - 0.1) * 10 + 0.5) / 10)
+                        elseif key == keys.right then
+                            state.volume = math.min(state.maxVolume, math.floor((state.volume + 0.1) * 10 + 0.5) / 10)
+                        end
+                    end
+                end
+            )
+        end)
+
+        for _, speaker in ipairs(speakers) do pcall(speaker.stop) end
+        resetPalette(mon)
+
+        if not playOk then
+            drawLoading(mon, w, h, "Playback error: " .. tostring(playErr))
+            os.sleep(2)
+            result = "done"
+            break
+        end
+
+        if state.stopRequested then
+            result = "stopped"
+            break
+        end
+    end
+
+    mon.setBackgroundColor(colors.black)
+    mon.setTextColor(colors.white)
+    mon.clear()
+    return result
+end
+
+return M

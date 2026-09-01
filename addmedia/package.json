@@ -1,0 +1,19 @@
+{
+  "name": "addmedia",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Unified music + video uploader for the Komanda X GitHub-hosted CC:Tweaked hub.",
+  "main": "cli.js",
+  "bin": "cli.js",
+  "pkg": {
+    "targets": [
+      "node18-win-x64"
+    ],
+    "outputPath": "dist"
+  },
+  "dependencies": {
+    "adm-zip": "^0.6.0",
+    "dfpwm": "^1.2.2",
+    "tar": "^7.5.22"
+  }
+}
