@@ -19,7 +19,17 @@ local function drawLoading(mon, w, h, text)
     mon.write(text)
 end
 
-local function fetchChunkToTemp(url)
+-- Downloads a chunk straight into memory and returns a "file"-like table
+-- (read/seek/close) the decoder can use directly, exactly the same way
+-- musicplayer.lua streams DFPWM straight from an http response without
+-- ever touching disk. The original version here wrote the chunk to a temp
+-- file on the COMPUTER's own storage first -- CC computers typically have
+-- a tiny disk quota (well under 1MB in a lot of server configs), and even
+-- a modest video segment blows straight through that ("Out of space",
+-- confirmed in-game). There's no reason to touch the filesystem for this
+-- at all; the whole point of streaming is that the bytes are already in
+-- memory the moment http.get finishes.
+local function fetchChunkToMemory(url)
     local cacheBustUrl = url .. (url:find("?") and "&" or "?") .. "t=" .. tostring(os.epoch("utc"))
     local response, err = http.get(cacheBustUrl, nil, true)
     if not response then
@@ -27,13 +37,25 @@ local function fetchChunkToTemp(url)
     end
     local body = response.readAll()
     response.close()
+    if not body or #body == 0 then
+        error("Downloaded video chunk was empty (0 bytes) -- check the chunk actually has data.")
+    end
 
-    local tmpPath = "video_chunk_" .. tostring(os.epoch("utc")) .. ".32vid"
-    local f = fs.open(tmpPath, "wb")
-    if not f then error("Could not open temp file for video chunk") end
-    f.write(body)
-    f.close()
-    return tmpPath
+    local pos = 1
+    local file = {}
+    function file.read(n)
+        if pos > #body then return nil end
+        local piece = body:sub(pos, pos + n - 1)
+        pos = pos + #piece
+        return piece
+    end
+    -- decodeModule only calls seek() with no arguments, to report a
+    -- position in an error message -- not used for actual seeking.
+    function file.seek()
+        return pos - 1
+    end
+    function file.close() end
+    return file
 end
 
 local function formatTime(seconds)
@@ -115,17 +137,11 @@ function M.play(mon, speakers, entry, config)
 
         drawLoading(mon, w, h, ("Loading %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
 
-        local tmpPath = fetchChunkToTemp(url)
-        local file = fs.open(tmpPath, "rb")
-        if not file then
-            fs.delete(tmpPath)
-            error("Could not reopen downloaded video chunk")
-        end
+        local file = fetchChunkToMemory(url)
 
         local ok, decoded = pcall(decodeModule.decode, file, function(i, n)
             drawLoading(mon, w, h, ("Loading %s (part %d/%d) %d%%..."):format(entry.name, chunkIndex, #entry.chunks, math.floor(i / n * 100)))
         end)
-        fs.delete(tmpPath)
         if not ok then
             if tostring(decoded):find("Terminated") then error(decoded, 0) end -- see the note by the playback pcall below
             drawLoading(mon, w, h, "Video decode error: " .. tostring(decoded))
