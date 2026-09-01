@@ -20,13 +20,25 @@
 -- table-construction math by hand; there's no independent way to verify
 -- correctness of a change to it outside a real CC:Tweaked runtime.
 --
--- Original 32vid-player-mini.lua renders each video frame straight to
--- `term` and plays each audio chunk immediately as it's decoded, in one
--- single pass. This module instead collects everything into the same
--- { width, height, fps, video, audio, subtitles } shape the rest of this
--- project's videoplayer.lua already expects (so videoplayer.lua's
--- rendering/playback loop didn't need to change), reading and decoding the
--- whole chunk up front rather than streaming it frame-by-frame.
+-- STREAMING, NOT BATCH: this was previously rewritten to collect every
+-- decoded video frame and audio chunk into video[]/audio[] arrays and
+-- return them all at once after reading the whole chunk file. That was a
+-- real mistake -- the ORIGINAL 32vid-player-mini.lua never does this, it
+-- renders each video frame and plays each audio chunk immediately as it's
+-- decoded, in one single streaming pass, holding at most one frame/chunk in
+-- memory at a time. A real chunk is ~90s * ~10fps = ~900 video frame
+-- records, each holding several ~2.7KB blit strings, plus ~90 one-second
+-- audio chunks decoded as raw PCM tables (which have far more overhead per
+-- element than packed bytes) -- collecting ALL of that into two big Lua
+-- tables before playback even starts is a genuinely large amount of memory
+-- pressure on a real CC:Tweaked computer, and is a very plausible
+-- contributor to the monitor corruption/freeze symptoms that persisted even
+-- after fps-capping and row-diffing the render side. This version goes back
+-- to the reference design: M.decode() takes `handlers` and invokes them
+-- inline per-record as it reads through the file, never accumulating more
+-- than the current frame/chunk. See videoplayer.lua for how playback pacing
+-- and audio dispatch now live inside those handler callbacks instead of a
+-- separate post-decode phase.
 
 local bit32_band, bit32_lshift, bit32_rshift, math_frexp = bit32.band, bit32.lshift, bit32.rshift, math.frexp
 local function log2(n) local _, r = math_frexp(n) return r - 1 end
@@ -36,12 +48,18 @@ local blitColors = { [0] = "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a"
 
 local M = {}
 
--- Decodes an already-open 32vid file handle (opened "rb") into
--- { width, height, fps, video, audio, subtitles }. Only supports the
--- single-stream, Combined (type 0x0C), ANS-compressed format sanjuuni.exe
--- 0.5 actually produces with -3 -d (with or without -S) -- see the header
--- comment above. Closes `file` when done.
-function M.decode(file, onProgress)
+-- Streams an already-open 32vid file handle (opened "rb") through
+-- `handlers`, a table of:
+--   handlers.onHeader(width, height, fps)       -- called once, up front
+--   handlers.onVideoFrame(frame, frameIndex)     -- frame = {palette=..., [1..height]={text,fg,bg}}
+--   handlers.onAudioChunk(chunk)                 -- chunk = PCM sample table (fire-and-forget, matches reference player)
+--   handlers.shouldStop() -> bool                -- checked before each record; decode aborts early if true
+-- Only supports the single-stream, Combined (type 0x0C), ANS-compressed
+-- format sanjuuni.exe 0.5 actually produces with -3 -d (with or without -S)
+-- -- see the header comment above. Closes `file` when done (including on
+-- early stop or error).
+function M.decode(file, handlers)
+    handlers = handlers or {}
     if file.read(4) ~= "32VD" then file.close() error("Not a 32vid file") end
     local width, height, fps, nstreams, flags = ("<HHBBH"):unpack(file.read(8))
     if nstreams ~= 1 then
@@ -57,6 +75,8 @@ function M.decode(file, onProgress)
         file.close()
         error(("This 32vid file's stream type (%d) isn't Combined (12), which this decoder doesn't support."):format(ctype))
     end
+
+    if handlers.onHeader then handlers.onHeader(width, height, fps) end
 
     -- ==== ANS (tANS-style) entropy decoder, ported verbatim ====
     local function readDict(size)
@@ -131,11 +151,13 @@ function M.decode(file, onProgress)
         return retval
     end
 
-    -- ==== Main per-frame loop -- collects into video[]/audio[]/subtitles ====
-    local video, audio, subtitles = {}, {}, nil
+    -- ==== Main per-frame loop -- streams straight to handlers, nothing
+    -- retained past the current record ====
     local vframe = 0
 
     for i = 1, nframes do
+        if handlers.shouldStop and handlers.shouldStop() then break end
+
         local size, ftype = ("<IB"):unpack(file.read(5))
 
         if ftype == 0 then
@@ -161,36 +183,31 @@ function M.decode(file, onProgress)
             for n = 1, 16 do
                 frame.palette[n] = { file.read() / 255, file.read() / 255, file.read() / 255 }
             end
-            video[#video + 1] = frame
 
             vframe = vframe + 1
-            if onProgress and (vframe % 20 == 0 or vframe >= nframes - 2) then
-                onProgress(vframe, nframes)
-                sleep(0)
-            end
+            if handlers.onVideoFrame then handlers.onVideoFrame(frame, vframe) end
         elseif ftype == 1 then
             local data = file.read(size)
+            local chunk
             if bit32_band(flags, 12) == 0 then
-                local chunk = { data:byte(1, -1) }
+                chunk = { data:byte(1, -1) }
                 for j = 1, #chunk do chunk[j] = chunk[j] - 128 end
-                audio[#audio + 1] = chunk
             else
-                audio[#audio + 1] = dfpwm.decode(data)
+                chunk = dfpwm.decode(data)
             end
+            -- Fire-and-forget, exactly like the reference player: no
+            -- waiting on speaker_audio_empty, no retry. The reference
+            -- design relies entirely on the video frame pacing above (which
+            -- runs interleaved with these audio records in file order) to
+            -- keep dispatch roughly real-time-paced. Waiting/retrying here
+            -- is what turned into the freeze -- one slow-to-drain speaker
+            -- among many networked ones stalling the whole shared timeline.
+            if handlers.onAudioChunk then handlers.onAudioChunk(chunk) end
         elseif ftype == 8 then
-            local data = file.read(size)
-            local start, length, x, y, color, subFlags, text = ("<IIHHBBs2"):unpack(data)
-            subtitles = subtitles or {}
-            local sub = {
-                text,
-                blitColors[bit32_band(color, 15)]:rep(#text),
-                blitColors[bit32_rshift(color, 4)]:rep(#text),
-                x = x, y = y,
-            }
-            for n = start, start + length - 1 do
-                subtitles[n] = subtitles[n] or {}
-                subtitles[n][#subtitles[n] + 1] = sub
-            end
+            -- Subtitle record: nothing in this project's UI renders
+            -- subtitles, so just consume the bytes and move on rather than
+            -- building tables no one reads.
+            file.read(size)
         else
             file.close()
             error(("Unknown/unsupported frame type %d (multi-monitor output isn't supported here)"):format(ftype))
@@ -198,8 +215,7 @@ function M.decode(file, onProgress)
     end
 
     file.close()
-    if #video == 0 then error("No video stream found in 32vid chunk") end
-    return { width = width, height = height, fps = fps, video = video, audio = audio, subtitles = subtitles }
+    if vframe == 0 then error("No video stream found in 32vid chunk") end
 end
 
 return M

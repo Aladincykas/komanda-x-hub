@@ -203,20 +203,8 @@ function M.play(mon, speakers, entry, config)
         drawLoading(mon, w, h, ("Loading %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
 
         local file = fetchChunkToMemory(url)
+        drawLoading(mon, w, h, ("Decoding %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
 
-        local ok, decoded = pcall(decodeModule.decode, file, function(i, n)
-            drawLoading(mon, w, h, ("Loading %s (part %d/%d) %d%%..."):format(entry.name, chunkIndex, #entry.chunks, math.floor(i / n * 100)))
-        end)
-        if not ok then
-            if tostring(decoded):find("Terminated") then error(decoded, 0) end -- see the note by the playback pcall below
-            drawLoading(mon, w, h, "Video decode error: " .. tostring(decoded))
-            os.sleep(2)
-            result = "done"
-            break
-        end
-
-        local fps = decoded.fps
-        local nFrames = #decoded.video
         local buttons = buildButtonLayout(w, h, math.floor(w / 2) + 1)
 
         local function saveVolume()
@@ -229,69 +217,56 @@ function M.play(mon, speakers, entry, config)
             saveVolume()
         end
 
+        -- Streaming decode+play: decodeModule.decode() calls these
+        -- handlers inline as it reads through the chunk, one record at a
+        -- time (see vendor/32vid-decode.lua's header comment for why this
+        -- replaced the old decode-everything-into-arrays-first approach).
+        -- Video frames are paced to fps and drawn here; audio chunks are
+        -- fired at every speaker with no wait/retry, exactly like
+        -- sanjuuni's own reference player -- the video pacing (interleaved
+        -- with audio records in file order) is what keeps playback roughly
+        -- real-time, not a separate acknowledgment-based audio clock.
+        local fps = 10
+        local frameStart = os.epoch("utc")
+        local lastPalette, lastRows = {}, {}
+        local framesPlayed = 0
+
+        local handlers = {
+            shouldStop = function() return state.stopRequested end,
+            onHeader = function(_, _, headerFps)
+                fps = headerFps
+                frameStart = os.epoch("utc")
+            end,
+            onVideoFrame = function(frame, frameIndex)
+                while state.paused and not state.stopRequested do
+                    os.pullEvent("video_control")
+                    frameStart = os.epoch("utc") - (frameIndex - 1) / fps * 1000 -- resume timing cleanly
+                end
+                if state.stopRequested then return end
+
+                drawFrame(mon, frame, lastPalette, lastRows)
+                state.elapsedSec = cumulativeSec + (frameIndex - 1) / fps
+                drawControls(mon, w, h, state, entry.durationSec or 0, buttons)
+                framesPlayed = frameIndex
+
+                while os.epoch("utc") < frameStart + (frameIndex + 1) / fps * 1000 do
+                    os.sleep(1 / fps)
+                    if state.stopRequested then break end
+                end
+            end,
+            onAudioChunk = function(chunk)
+                if state.stopRequested then return end
+                for _, speaker in ipairs(speakers) do
+                    speaker.playAudio(chunk, state.volume)
+                end
+            end,
+        }
+
         local playOk, playErr = pcall(function()
-            parallel.waitForAll(
-                function() -- video render, paced to fps
-                    local start = os.epoch("utc")
-                    local f = 1
-                    local lastPalette = {}
-                    local lastRows = {}
-                    while f <= nFrames and not state.stopRequested do
-                        while state.paused and not state.stopRequested do
-                            os.pullEvent("video_control")
-                            start = os.epoch("utc") - (f - 1) / fps * 1000 -- resume timing cleanly
-                        end
-                        if state.stopRequested then break end
-
-                        drawFrame(mon, decoded.video[f], lastPalette, lastRows)
-                        state.elapsedSec = cumulativeSec + (f - 1) / fps
-                        drawControls(mon, w, h, state, entry.durationSec or 0, buttons)
-
-                        while os.epoch("utc") < start + (f + 1) / fps * 1000 do
-                            os.sleep(1 / fps)
-                            if state.stopRequested then break end
-                        end
-                        f = f + 1
-                    end
-                    cumulativeSec = cumulativeSec + nFrames / fps
-                end,
-                function() -- audio, fanned out to every networked speaker
-                    -- REVERTED the wall-clock fire-and-forget version --
-                    -- confirmed in-game it made actual sound quality worse
-                    -- ("first time... sound played properly", this one
-                    -- didn't), because dropping any chunk a speaker's
-                    -- buffer wasn't immediately ready for is a real
-                    -- correctness cost, not a minor one. Back to each
-                    -- speaker waiting for its own real
-                    -- speaker_audio_empty acknowledgment (the version that
-                    -- actually sounded right), but STILL with the 3s
-                    -- per-speaker timeout from before so one dead speaker
-                    -- among the many networked ones can't freeze the
-                    -- whole video again either.
-                    if not decoded.audio or #speakers == 0 then return end
-                    local funcs = {}
-                    for _, speaker in ipairs(speakers) do
-                        funcs[#funcs + 1] = function()
-                            for _, chunk in ipairs(decoded.audio) do
-                                if state.stopRequested then break end
-                                while not state.stopRequested and not speaker.playAudio(chunk, state.volume) do
-                                    local timerId = os.startTimer(3)
-                                    local gaveUp = false
-                                    repeat
-                                        local ev, a, b = os.pullEvent()
-                                        if ev == "speaker_audio_empty" and a == peripheral.getName(speaker) then
-                                            break
-                                        elseif ev == "timer" and a == timerId then
-                                            gaveUp = true
-                                            break
-                                        end
-                                    until state.stopRequested
-                                    if gaveUp or state.stopRequested then break end
-                                end
-                            end
-                        end
-                    end
-                    parallel.waitForAll(table.unpack(funcs))
+            parallel.waitForAny(
+                function()
+                    decodeModule.decode(file, handlers)
+                    cumulativeSec = cumulativeSec + framesPlayed / fps
                 end,
                 function() -- input handling: keyboard (at the Computer) and touch (at the monitor)
                     while not state.stopRequested do
