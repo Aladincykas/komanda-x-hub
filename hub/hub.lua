@@ -308,49 +308,106 @@ end
 local function runVideoMenu(frame)
     local videoplayer = require("videoplayer") -- loaded on first entry to this screen only
     local exitReason = nil
+    local page = 1
+
+    -- addButton-per-row instead of Basalt's List element -- a video
+    -- ("Bad Apple 2") confirmed present in the fetched data (checked
+    -- directly against the raw CDN endpoint, not just the GitHub API)
+    -- still didn't show up in-game through List. List is a much more
+    -- complex element (scroll state, item views, click-vs-drag handling)
+    -- than addLabel/addButton, which have been reliable everywhere else
+    -- in this codebase, so rather than keep debugging a black box,
+    -- switched to the exact pattern already proven working on the music
+    -- library screen: real pagination via addButton rows.
+    local ROW_STEP = 2
+    local contentTop = 3
+    local footerRow = h
 
     while not exitReason and not _G.KOMANDA_TERMINATED do
-        clearFrameChildren(frame)
         local videos = fetchMergedManifest(videoManifestUrls(), "videos.json")
         local selectedVideo = nil
+        local perPage = math.max(1, math.floor((footerRow - contentTop) / ROW_STEP))
+        local totalPages = math.max(1, math.ceil(#videos / perPage))
 
-        frame:addLabel()
-            :setText((" SELECT A VIDEO "):sub(1, w))
-            :setSize(w, 1)
-            :setPosition(1, 1)
-            :setForeground(colors.lime)
-            :setBackground(colors.gray)
+        local function drawVideoMenu()
+            clearFrameChildren(frame)
+            if page > totalPages then page = totalPages end
 
-        if #videos == 0 then
             frame:addLabel()
-                :setText("No videos yet. Upload with addmedia (Video mode).")
-                :setPosition(2, 3)
+                :setText((" SELECT A VIDEO "):sub(1, w))
+                :setSize(w, 1)
+                :setPosition(1, 1)
+                :setForeground(colors.lime)
+                :setBackground(colors.gray)
+
+            frame:addLabel()
+                :setText(#videos == 0 and "No videos yet." or ("%d video(s) -- page %d/%d"):format(#videos, page, totalPages))
+                :setPosition(2, 2)
                 :setForeground(colors.lightGray)
                 :setBackground(colors.black)
-        else
-            local list = frame:addList()
-                :setPosition(2, 3)
-                :setSize(w - 2, h - 5)
-                :setBackground(colors.black)
+
+            if #videos == 0 then
+                frame:addLabel()
+                    :setText("Upload one with addmedia (Video mode).")
+                    :setPosition(2, contentTop)
+                    :setForeground(colors.lightGray)
+                    :setBackground(colors.black)
+            else
+                local startIdx = (page - 1) * perPage + 1
+                for i = 0, perPage - 1 do
+                    local idx = startIdx + i
+                    local video = videos[idx]
+                    if video then
+                        frame:addButton()
+                            :setText(video.name:sub(1, w - 4))
+                            :setPosition(2, contentTop + i * ROW_STEP)
+                            :setSize(w - 2, 1)
+                            :setBackground(colors.gray)
+                            :setForeground(colors.lime)
+                            :onClick(function()
+                                selectedVideo = video
+                                basalt.stop()
+                            end)
+                    end
+                end
+            end
+
+            local navW = math.min(math.floor((w - 8) / 3), 14)
+            frame:addButton()
+                :setText("< Prev")
+                :setPosition(2, footerRow)
+                :setSize(navW, 1)
+                :setBackground(colors.gray)
                 :setForeground(colors.lime)
-            for _, v in ipairs(videos) do list:addItem(v.name) end
-            list:onSelect(function(_, index)
-                selectedVideo = videos[index]
-                basalt.stop()
-            end)
+                :onClick(function()
+                    if page > 1 then page = page - 1 end
+                    drawVideoMenu()
+                end)
+
+            frame:addButton()
+                :setText("Next >")
+                :setPosition(4 + navW, footerRow)
+                :setSize(navW, 1)
+                :setBackground(colors.gray)
+                :setForeground(colors.lime)
+                :onClick(function()
+                    if page < totalPages then page = page + 1 end
+                    drawVideoMenu()
+                end)
+
+            frame:addButton()
+                :setText("Back to Menu")
+                :setPosition(w - math.min(w - 2, 16) + 1, footerRow)
+                :setSize(math.min(w - 2, 16), 1)
+                :setBackground(colors.red)
+                :setForeground(colors.white)
+                :onClick(function()
+                    exitReason = "menu"
+                    basalt.stop()
+                end)
         end
 
-        frame:addButton()
-            :setText("Back to Menu")
-            :setPosition(2, h)
-            :setSize(math.min(w - 2, 16), 1)
-            :setBackground(colors.red)
-            :setForeground(colors.white)
-            :onClick(function()
-                exitReason = "menu"
-                basalt.stop()
-            end)
-
+        drawVideoMenu()
         frame:draw() -- force the first real render before any schedule()d coroutine runs
 
         -- Idle timeout: event polling, not a Basalt event hook -- basalt.
