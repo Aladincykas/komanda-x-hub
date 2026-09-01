@@ -65,6 +65,26 @@ const DEFAULT_SEGMENT_SECONDS = 90;
 // this range for exactly this reason) keeps the redraw rate sane.
 const DEFAULT_FPS_CAP = 10;
 
+// CC:Tweaked monitors have exactly ONE 16-color palette for the whole
+// screen -- there's no such thing as "the video's colors" vs "the UI's
+// colors" as separate things, they're the same 16 slots. Since
+// videoplayer.lua draws its control-bar text using colors.white/lime/red/
+// black, and the video remaps ALL 16 slots every frame to whatever colors
+// that frame's content needs, the control bar's text was getting
+// reinterpreted through the video's own colors every frame (confirmed
+// in-game: "buttons change[d] color [to] what the video is"). sanjuuni's
+// -P/--palette flag can LOCK specific slots to a fixed color while
+// leaving the rest free to auto-optimize for the video -- locking exactly
+// the 4 slots the control bar uses, to CC:Tweaked's own real default RGB
+// for those colors (Colour.java: WHITE=0xf0f0f0, LIME=0x7fcc19,
+// RED=0xcc4c4c, BLACK=0x111111), makes them genuinely stable no matter
+// what the video is doing, and looks the same as every other screen in
+// the hub that never touches the palette at all. 16 comma-separated
+// entries in palette-array order (white, orange, magenta, lightBlue,
+// yellow, lime, pink, gray, lightGray, cyan, purple, blue, brown, green,
+// red, black) -- blank entries are left for sanjuuni to auto-optimize.
+const LOCKED_PALETTE = "f0f0f0,,,,,7fcc19,,,,,,,,,cc4c4c,111111";
+
 function ask(question) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     return new Promise((resolve) => rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); }));
@@ -318,7 +338,7 @@ async function convertVideoLocally(inputPath, workDir, baseName, opts) {
             // (which expects separate Video=0/Audio=1 streams sanjuuni
             // 0.5 doesn't actually produce) -- see that file's header
             // comment for the full story.
-            "-3", "-d",
+            "-3", "-d", "-P", LOCKED_PALETTE,
             "-W", String(pixelWidth), "-H", String(pixelHeight),
         ]);
         fs.unlinkSync(path.join(workDir, segments[i]));
