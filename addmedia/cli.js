@@ -54,6 +54,16 @@ const CHUNK_WARN_BYTES = 15 * 1024 * 1024;
 const DEFAULT_CHAR_WIDTH = 71;
 const DEFAULT_CHAR_HEIGHT = 38; // 40 - 2 rows for the control bar
 const DEFAULT_SEGMENT_SECONDS = 90;
+// A CC:Tweaked monitor redraw is a full-screen mon.blit PLUS 16
+// setPaletteColor calls, every single frame -- at a source video's native
+// fps (30 for most YouTube content) that's an extreme render load,
+// especially on a large multi-block monitor. Confirmed in-game: playing a
+// 30fps video made the physical monitor go black and stay corrupted even
+// across a reboot, only recoverable by breaking and replacing the block --
+// a Minecraft/CC-side renderer overload, not a Lua bug. Capping the
+// converted video's fps (most CC:Tweaked video projects use something in
+// this range for exactly this reason) keeps the redraw rate sane.
+const DEFAULT_FPS_CAP = 10;
 
 function ask(question) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -251,14 +261,16 @@ async function convertVideoLocally(inputPath, workDir, baseName, opts) {
     await ensureSanjuuni();
 
     console.log("Probing source video...");
-    const { durationSec, fps } = probeVideo(inputPath);
-    console.log(`  duration: ${durationSec}s, fps: ${fps}, output: ${pixelWidth}x${pixelHeight}px (${charWidth}x${charHeight} chars)`);
+    const { durationSec, fps: sourceFps } = probeVideo(inputPath);
+    const fps = Math.min(sourceFps, DEFAULT_FPS_CAP);
+    console.log(`  duration: ${durationSec}s, source fps: ${sourceFps} -> capped to ${fps}, output: ${pixelWidth}x${pixelHeight}px (${charWidth}x${charHeight} chars)`);
 
     fs.mkdirSync(workDir, { recursive: true });
     const segmentPattern = path.join(workDir, "seg_%04d.mp4");
-    console.log(`Segmenting into ~${segmentSeconds}s parts...`);
+    console.log(`Segmenting into ~${segmentSeconds}s parts at ${fps}fps...`);
     run(FFMPEG_PATH, [
         "-y", "-i", inputPath,
+        "-r", String(fps),
         "-c:v", "libx264", "-preset", "veryfast",
         "-force_key_frames", `expr:gte(t,n_forced*${segmentSeconds})`,
         "-c:a", "aac", "-map", "0",

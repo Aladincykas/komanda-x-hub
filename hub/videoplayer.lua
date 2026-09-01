@@ -139,9 +139,17 @@ local function hitTestButton(buttons, x, y)
     return nil
 end
 
-local function drawFrame(mon, image)
+-- lastPalette (a {r,g,b} per color, mutated in place) lets this skip a
+-- setPaletteColor call for any color that didn't actually change since the
+-- previous frame -- one more cut at the render cost that was overloading
+-- the physical monitor (see the fps-cap note above DEFAULT_FPS_CAP).
+local function drawFrame(mon, image, lastPalette)
     for i, v in ipairs(image.palette) do
-        mon.setPaletteColor(2 ^ (i - 1), table.unpack(v))
+        local prev = lastPalette[i]
+        if not prev or prev[1] ~= v[1] or prev[2] ~= v[2] or prev[3] ~= v[3] then
+            mon.setPaletteColor(2 ^ (i - 1), v[1], v[2], v[3])
+            lastPalette[i] = v
+        end
     end
     for y, r in ipairs(image) do
         mon.setCursorPos(1, y)
@@ -214,6 +222,7 @@ function M.play(mon, speakers, entry, config)
                 function() -- video render, paced to fps
                     local start = os.epoch("utc")
                     local f = 1
+                    local lastPalette = {}
                     while f <= nFrames and not state.stopRequested do
                         while state.paused and not state.stopRequested do
                             os.pullEvent("video_control")
@@ -221,7 +230,7 @@ function M.play(mon, speakers, entry, config)
                         end
                         if state.stopRequested then break end
 
-                        drawFrame(mon, decoded.video[f])
+                        drawFrame(mon, decoded.video[f], lastPalette)
                         state.elapsedSec = cumulativeSec + (f - 1) / fps
                         drawControls(mon, w, h, state, entry.durationSec or 0, buttons)
 
