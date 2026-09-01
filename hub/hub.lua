@@ -11,11 +11,15 @@
 -- your already-working music.lua, and rebuilding a proven screen on a new
 -- framework for its own sake isn't worth the risk, so it keeps its own
 -- raw term.blit + key-driven UI.
+--
+-- videoplayer.lua and musicplayer.lua are required lazily, right where
+-- each is first used (inside runVideoMenu / the music branch below), not
+-- up front here -- so picking "Music" never even loads the video/32vid
+-- decoder code, and vice versa. Lua caches a module after its first
+-- require() either way, so entering that screen twice doesn't reload it.
 
 local config = require("config")
 local Matrix = require("matrix")
-local videoplayer = require("videoplayer")
-local musicplayer = require("musicplayer")
 local basalt = require("basalt")
 
 local mon = peripheral.wrap(config.MONITOR_NAME)
@@ -172,6 +176,7 @@ end
 
 -- ==== Video selection menu ====
 local function runVideoMenu()
+    local videoplayer = require("videoplayer") -- loaded on first entry to this screen only
     local exitReason = nil
 
     while not exitReason do
@@ -259,6 +264,7 @@ while true do
     if target == "video" then
         runVideoMenu() -- returns on "menu" (Back button) or "idle" -> main menu
     else
+        local musicplayer = require("musicplayer") -- loaded on first entry to this screen only
         musicplayer.run(mon, speakers, config) -- returns on "menu" or "idle" -> main menu
     end
 end
