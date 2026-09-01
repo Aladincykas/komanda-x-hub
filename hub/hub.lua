@@ -127,12 +127,16 @@ local function runMainMenu(frame)
     -- first step -- as long as the box's full rectangle (border AND
     -- interior gaps) stays inside the matrix's exclusion zone, that black
     -- fill is never touched again and reads as a solid panel.
-    local boxW = math.max(#spaced, buttonW) + 4
-    local boxH = 7 -- top border(1) title(1) gap(1) button(1) gap(1) button(1) bottom border(1)
+    -- Dark theme: black interior, muted gray border/buttons, white text.
+    -- Extra +6/9-row sizing (was +4/7) gives the box real breathing room
+    -- (a blank row after the top border, before the bottom border, and
+    -- around the title) instead of text crammed right against the edges.
+    local boxW = math.max(#spaced, buttonW) + 6
+    local boxH = 9 -- border, gap, title, gap, button, gap, button, gap, border
     local boxX = math.max(1, math.floor((w - boxW) / 2) + 1)
     local boxY = math.max(1, math.floor((h - boxH) / 2) + 1)
 
-    local BORDER_COLOR = colors.cyan
+    local BORDER_COLOR = colors.lightGray
     frame:addLabel()
         :setText(("="):rep(boxW))
         :setPosition(boxX, boxY)
@@ -148,7 +152,7 @@ local function runMainMenu(frame)
         frame:addLabel():setText("|"):setPosition(boxX + boxW - 1, row):setForeground(BORDER_COLOR):setBackground(colors.black)
     end
 
-    local titleY = boxY + 1
+    local titleY = boxY + 2
     local menuTop = titleY + 2
     local tx = boxX + math.max(1, math.floor((boxW - #spaced) / 2))
     local bx = boxX + math.max(1, math.floor((boxW - buttonW) / 2))
@@ -156,14 +160,14 @@ local function runMainMenu(frame)
     frame:addLabel()
         :setText(spaced)
         :setPosition(tx, titleY)
-        :setForeground(colors.yellow)
+        :setForeground(colors.white)
         :setBackground(colors.black)
 
     frame:addButton()
         :setText("VIDEO PLAYER")
         :setPosition(bx, menuTop)
         :setSize(buttonW, 1)
-        :setBackground(colors.blue)
+        :setBackground(colors.gray)
         :setForeground(colors.white)
         :onClick(function()
             chosen = "video"
@@ -174,7 +178,7 @@ local function runMainMenu(frame)
         :setText("MUSIC PLAYER")
         :setPosition(bx, menuTop + 2)
         :setSize(buttonW, 1)
-        :setBackground(colors.magenta)
+        :setBackground(colors.gray)
         :setForeground(colors.white)
         :onClick(function()
             chosen = "music"
@@ -259,7 +263,7 @@ local function runVideoMenu(frame)
             :setSize(w, 1)
             :setPosition(1, 1)
             :setForeground(colors.white)
-            :setBackground(colors.blue)
+            :setBackground(colors.gray)
 
         if #videos == 0 then
             frame:addLabel()
