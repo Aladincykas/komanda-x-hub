@@ -122,6 +122,7 @@ function M.play(mon, speakers, entry, config)
         end)
         fs.delete(tmpPath)
         if not ok then
+            if tostring(decoded):find("Terminated") then error(decoded, 0) end -- see the note by the playback pcall below
             drawLoading(mon, w, h, "Video decode error: " .. tostring(decoded))
             os.sleep(2)
             result = "done"
@@ -195,6 +196,17 @@ function M.play(mon, speakers, entry, config)
         resetPalette(mon)
 
         if not playOk then
+            -- Ctrl+T raises "Terminated" through os.pullEvent -- pcall would
+            -- otherwise silently swallow that and let playback continue, so
+            -- Ctrl+T would appear to do nothing while a video is playing.
+            -- Re-raise it so termination actually propagates and stops the
+            -- whole program, same as it would anywhere else.
+            if tostring(playErr):find("Terminated") then
+                mon.setBackgroundColor(colors.black)
+                mon.setTextColor(colors.white)
+                mon.clear()
+                error(playErr, 0)
+            end
             drawLoading(mon, w, h, "Playback error: " .. tostring(playErr))
             os.sleep(2)
             result = "done"
