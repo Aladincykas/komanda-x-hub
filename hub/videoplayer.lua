@@ -79,32 +79,64 @@ local function formatTime(seconds)
     return ("%d:%02d"):format(m, s)
 end
 
--- Draws the bottom control bar on top of whatever frame is currently shown.
-local function drawControls(mon, w, h, state, totalDurationSec)
+-- Two-row touch control bar: row h-1 is info text (elapsed/volume%/
+-- remaining), row h is real buttons with known hit-test rectangles. This
+-- screen draws the whole video frame with raw mon.blit every frame (like
+-- the main menu's matrix rain, at a much higher redraw rate), so it can't
+-- use Basalt here the same way the music player does -- Basalt only
+-- repaints on property changes, and a full-screen redraw every frame would
+-- either fight it or get overdrawn by it. Buttons are just drawn rectangles
+-- + monitor_touch hit-testing, computed fresh each call and reused by the
+-- input handler below.
+local function buildButtonLayout(w, h)
+    local labels = { "Pause", "Stop", "-10%", "-1%", "+1%", "+10%" }
+    local n = #labels
+    local gap = 1
+    local btnW = math.max(4, math.floor((w - gap * (n - 1)) / n))
+    local totalW = btnW * n + gap * (n - 1)
+    local startX = math.max(1, math.floor((w - totalW) / 2) + 1)
+    local buttons = {}
+    for i, label in ipairs(labels) do
+        local x1 = startX + (i - 1) * (btnW + gap)
+        buttons[i] = { label = label, x1 = x1, x2 = x1 + btnW - 1, y = h, w = btnW }
+    end
+    return buttons
+end
+
+local function drawControls(mon, w, h, state, totalDurationSec, buttons)
     local elapsed = state.elapsedSec
     local remaining = math.max(0, totalDurationSec - elapsed)
+    local pct = math.floor(state.volume / state.maxVolume * 100 + 0.5)
 
     mon.setBackgroundColor(colors.gray)
     mon.setTextColor(colors.white)
+    mon.setCursorPos(1, h - 1)
+    mon.clearLine()
+    local infoText = ("%s   Vol %d%%   -%s"):format(formatTime(elapsed), pct, formatTime(remaining))
+    mon.setCursorPos(math.max(1, math.floor((w - #infoText) / 2) + 1), h - 1)
+    mon.write(infoText)
+
     mon.setCursorPos(1, h)
     mon.clearLine()
-
-    local playIcon = state.paused and "||" or ">"
-    local left = (" %s %s"):format(playIcon, formatTime(elapsed))
-    local right = ("-%s "):format(formatTime(remaining))
-    local volSegments = 8
-    local filled = math.max(0, math.min(volSegments, math.floor((state.volume / state.maxVolume) * volSegments + 0.5)))
-    local volBar = ("Vol[" .. ("#"):rep(filled) .. ("-"):rep(volSegments - filled) .. ("%3d%%"):format(math.floor(state.volume / state.maxVolume * 100 + 0.5)) .. "]")
-
-    mon.setCursorPos(1, h)
-    mon.write(left)
-    mon.setCursorPos(w - #right + 1, h)
-    mon.write(right)
-    local volX = math.max(#left + 2, math.floor((w - #volBar) / 2) + 1)
-    mon.setCursorPos(volX, h)
-    mon.write(volBar)
+    for i, btn in ipairs(buttons) do
+        local label = (i == 1 and state.paused) and "Play" or btn.label
+        mon.setCursorPos(btn.x1, btn.y)
+        mon.setBackgroundColor(i == 2 and colors.red or colors.gray)
+        mon.setTextColor(colors.lime)
+        local text = label
+        local pad = btn.w - #text
+        local leftPad = math.floor(pad / 2)
+        mon.write((" "):rep(math.max(0, leftPad)) .. text .. (" "):rep(math.max(0, pad - leftPad)))
+    end
 
     mon.setBackgroundColor(colors.black)
+end
+
+local function hitTestButton(buttons, x, y)
+    for i, btn in ipairs(buttons) do
+        if y == btn.y and x >= btn.x1 and x <= btn.x2 then return i end
+    end
+    return nil
 end
 
 local function drawFrame(mon, image)
@@ -165,6 +197,17 @@ function M.play(mon, speakers, entry, config)
 
         local fps = decoded.fps
         local nFrames = #decoded.video
+        local buttons = buildButtonLayout(w, h)
+
+        local function saveVolume()
+            savedSettings.videoVolume = state.volume
+            settings.save(savedSettings)
+        end
+        local function adjustVolume(deltaFraction)
+            local step = deltaFraction * state.maxVolume
+            state.volume = math.max(0, math.min(state.maxVolume, state.volume + step))
+            saveVolume()
+        end
 
         local playOk, playErr = pcall(function()
             parallel.waitForAll(
@@ -180,7 +223,7 @@ function M.play(mon, speakers, entry, config)
 
                         drawFrame(mon, decoded.video[f])
                         state.elapsedSec = cumulativeSec + (f - 1) / fps
-                        drawControls(mon, w, h, state, entry.durationSec or 0)
+                        drawControls(mon, w, h, state, entry.durationSec or 0, buttons)
 
                         while os.epoch("utc") < start + (f + 1) / fps * 1000 do
                             os.sleep(1 / fps)
@@ -197,33 +240,67 @@ function M.play(mon, speakers, entry, config)
                         funcs[#funcs + 1] = function()
                             for _, chunk in ipairs(decoded.audio) do
                                 if state.stopRequested then break end
+                                -- Timeout on speaker_audio_empty, NOT an
+                                -- unbounded wait -- with many networked
+                                -- speakers (confirmed: this installation
+                                -- has dozens), if even ONE never fires that
+                                -- event (out of range, disconnected,
+                                -- whatever), the whole video froze forever
+                                -- waiting on it (confirmed in-game: playback
+                                -- stuck at a fixed elapsed time with no
+                                -- error). After 3s of no response from THIS
+                                -- speaker, just move on instead of hanging.
                                 while not state.stopRequested and not speaker.playAudio(chunk, state.volume) do
+                                    local timerId = os.startTimer(3)
+                                    local gaveUp = false
                                     repeat
-                                        local ev, name = os.pullEvent("speaker_audio_empty")
-                                    until state.stopRequested or name == peripheral.getName(speaker)
+                                        local ev, a, b = os.pullEvent()
+                                        if ev == "speaker_audio_empty" and a == peripheral.getName(speaker) then
+                                            break
+                                        elseif ev == "timer" and a == timerId then
+                                            gaveUp = true
+                                            break
+                                        end
+                                    until state.stopRequested
+                                    if gaveUp or state.stopRequested then break end
                                 end
                             end
                         end
                     end
                     parallel.waitForAll(table.unpack(funcs))
                 end,
-                function() -- input handling
+                function() -- input handling: keyboard (at the Computer) and touch (at the monitor)
                     while not state.stopRequested do
-                        local ev, key = os.pullEvent("key")
-                        if key == keys.space then
+                        local event, a, b, c = os.pullEvent()
+                        local action = nil
+
+                        if event == "key" then
+                            if a == keys.space then action = "playpause"
+                            elseif a == keys.s then action = "stop"
+                            elseif a == keys.left then action = "vol-1"
+                            elseif a == keys.right then action = "vol+1"
+                            end
+                        elseif event == "monitor_touch" then
+                            local idx = hitTestButton(buttons, b, c)
+                            if idx == 1 then action = "playpause"
+                            elseif idx == 2 then action = "stop"
+                            elseif idx == 3 then action = "vol-10"
+                            elseif idx == 4 then action = "vol-1"
+                            elseif idx == 5 then action = "vol+1"
+                            elseif idx == 6 then action = "vol+10"
+                            end
+                        end
+
+                        if action == "playpause" then
                             state.paused = not state.paused
                             os.queueEvent("video_control")
-                        elseif key == keys.s then
+                        elseif action == "stop" then
                             state.stopRequested = true
                             os.queueEvent("video_control")
-                        elseif key == keys.left then
-                            state.volume = math.max(0, math.floor((state.volume - 0.1) * 10 + 0.5) / 10)
-                            savedSettings.videoVolume = state.volume
-                            settings.save(savedSettings)
-                        elseif key == keys.right then
-                            state.volume = math.min(state.maxVolume, math.floor((state.volume + 0.1) * 10 + 0.5) / 10)
-                            savedSettings.videoVolume = state.volume
-                            settings.save(savedSettings)
+                        elseif action == "vol-1" then adjustVolume(-0.01)
+                        elseif action == "vol+1" then adjustVolume(0.01)
+                        elseif action == "vol-10" then adjustVolume(-0.10)
+                        elseif action == "vol+10" then adjustVolume(0.10)
                         end
                     end
                 end
