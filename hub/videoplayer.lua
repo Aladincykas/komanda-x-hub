@@ -108,21 +108,32 @@ local function drawControls(mon, w, h, state, totalDurationSec, buttons)
     local remaining = math.max(0, totalDurationSec - elapsed)
     local pct = math.floor(state.volume / state.maxVolume * 100 + 0.5)
 
+    -- Row h-1: elapsed left / volume% center / remaining right, same
+    -- layout as the original (pre-touch) control bar.
     mon.setBackgroundColor(colors.gray)
     mon.setTextColor(colors.white)
     mon.setCursorPos(1, h - 1)
     mon.clearLine()
-    local infoText = ("%s   Vol %d%%   -%s"):format(formatTime(elapsed), pct, formatTime(remaining))
-    mon.setCursorPos(math.max(1, math.floor((w - #infoText) / 2) + 1), h - 1)
-    mon.write(infoText)
+    local playIcon = state.paused and "||" or ">"
+    local left = (" %s %s"):format(playIcon, formatTime(elapsed))
+    local right = ("-%s "):format(formatTime(remaining))
+    local volText = ("Vol %d%%"):format(pct)
+    mon.setCursorPos(1, h - 1)
+    mon.write(left)
+    mon.setCursorPos(w - #right + 1, h - 1)
+    mon.write(right)
+    mon.setCursorPos(math.max(#left + 2, math.floor((w - #volText) / 2) + 1), h - 1)
+    mon.write(volText)
 
+    -- Row h: buttons only, black background.
+    mon.setBackgroundColor(colors.black)
     mon.setCursorPos(1, h)
     mon.clearLine()
     for i, btn in ipairs(buttons) do
         local label = (i == 1 and state.paused) and "Play" or btn.label
         mon.setCursorPos(btn.x1, btn.y)
-        mon.setBackgroundColor(i == 2 and colors.red or colors.gray)
-        mon.setTextColor(colors.lime)
+        mon.setBackgroundColor(colors.black)
+        mon.setTextColor(i == 2 and colors.red or colors.lime)
         local text = label
         local pad = btn.w - #text
         local leftPad = math.floor(pad / 2)
