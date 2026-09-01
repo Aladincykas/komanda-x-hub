@@ -87,23 +87,40 @@ local function runMainMenu()
     local spaced = title:gsub(".", "%1 "):sub(1, -2) -- letter-spaced for a "big" look on a 1-row font
     local buttonW = math.min(w - 4, 24)
 
-    -- Whole menu (title + gap + 2 buttons) centered as one block, rather
-    -- than an arbitrary "28% down" title with buttons hanging off it.
-    local BLOCK_HEIGHT = 6 -- title(1) + gap(2) + button(1) + gap(1) + button(1)
-    local blockTop = math.max(2, math.floor((h - BLOCK_HEIGHT) / 2) + 1)
-    local titleY = blockTop
-    local menuTop = titleY + 3
+    -- A real solid bordered panel, not just "cells the rain skips" --
+    -- requested after the exclusion-only approach still let rain crowd
+    -- right up against the title/buttons. Classic terminal-UI border
+    -- trick: a slightly bigger colored frame, with a black frame inset by
+    -- 1 cell on top of it, leaving a visible 1-cell-thick border ring.
+    local innerW = math.max(#spaced, buttonW) + 4
+    local innerH = 8 -- title(1) + gap(1) + button(1) + gap(1) + button(1) + top/bottom margin(2,1)
+    local borderW, borderH = innerW + 2, innerH + 2
+    local borderX = math.max(1, math.floor((w - borderW) / 2) + 1)
+    local borderY = math.max(1, math.floor((h - borderH) / 2) + 1)
 
-    local tx = math.max(1, math.floor((w - #spaced) / 2) + 1)
-    local bx = math.floor((w - buttonW) / 2) + 1
+    local border = frame:addFrame({
+        x = borderX, y = borderY, width = borderW, height = borderH,
+        background = colors.yellow,
+    })
+    local panel = border:addFrame({
+        x = 2, y = 2, width = innerW, height = innerH,
+        background = colors.black,
+    })
 
-    frame:addLabel()
+    -- Everything below is positioned relative to `panel`'s own top-left,
+    -- not the monitor's.
+    local titleY = 2
+    local menuTop = titleY + 2
+    local tx = math.max(1, math.floor((innerW - #spaced) / 2) + 1)
+    local bx = math.max(1, math.floor((innerW - buttonW) / 2) + 1)
+
+    panel:addLabel()
         :setText(spaced)
         :setPosition(tx, titleY)
         :setForeground(colors.yellow)
         :setBackground(colors.black)
 
-    frame:addButton()
+    panel:addButton()
         :setText("VIDEO PLAYER")
         :setPosition(bx, menuTop)
         :setSize(buttonW, 1)
@@ -114,7 +131,7 @@ local function runMainMenu()
             basalt.stop()
         end)
 
-    frame:addButton()
+    panel:addButton()
         :setText("MUSIC PLAYER")
         :setPosition(bx, menuTop + 2)
         :setSize(buttonW, 1)
@@ -128,22 +145,16 @@ local function runMainMenu()
     -- Force the very first real render now, before the matrix starts
     -- ticking below -- basalt.schedule() runs its function immediately
     -- (up to its first yield), so without this the matrix's first step
-    -- could run before Basalt has ever actually flushed the title/buttons
-    -- to the monitor.
+    -- could run before Basalt has ever actually flushed the panel to the
+    -- monitor.
     frame:draw()
 
-    -- Basalt only repaints a widget's own cells when one of its properties
-    -- changes -- it does not continuously redraw the whole frame. So the
-    -- matrix rain must never write into a cell a widget owns, or it
-    -- permanently erases it the first time it passes through (confirmed
-    -- in-game). A 1-cell padding margin keeps the rain from crowding right
-    -- up against the text too. Every widget's rectangle above must be
-    -- listed here.
-    local PAD = 1
+    -- The whole bordered box is solid, opaque, and drawn by Basalt, so the
+    -- matrix just needs to avoid that one rectangle entirely -- no more
+    -- crowding-the-text problem, since there's no text cells to crowd,
+    -- just one clean box.
     matrix:setExclusions({
-        { tx - PAD, titleY, tx + #spaced - 1 + PAD, titleY },
-        { bx - PAD, menuTop - PAD, bx + buttonW - 1 + PAD, menuTop + PAD },
-        { bx - PAD, menuTop + 2 - PAD, bx + buttonW - 1 + PAD, menuTop + 2 + PAD },
+        { borderX, borderY, borderX + borderW - 1, borderY + borderH - 1 },
     })
 
     -- Background matrix rain, redrawn continuously behind the frame's

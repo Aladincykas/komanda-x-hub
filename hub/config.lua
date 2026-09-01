@@ -12,7 +12,14 @@ return {
     -- "monitor_295", as shown by `peripheral.getNames()`) if it's reached
     -- through a modem instead.
     MONITOR_NAME = "back",
-    MONITOR_TEXT_SCALE = 0.5, -- tune until monitor.getSize() reports 71 x 40
+    -- Confirmed in-game via a diagnostic print: this monitor reports
+    -- 143x81 characters at scale 0.5 -- CC:Tweaked's character grid is
+    -- roughly inversely proportional to scale, so scale 1.0 should land
+    -- close to 71x40 (much bigger, more legible text; fewer, larger touch
+    -- targets). Bump this further (1.5, 2...) if it's still too small, or
+    -- back toward 0.5 if you want more content density instead. Re-run
+    -- hub/basalttest.lua after changing this to see the new mon size.
+    MONITOR_TEXT_SCALE = 1.0,
 
     GITHUB_USER = "Aladincykas",
 
