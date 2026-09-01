@@ -71,8 +71,13 @@ end
 local function glyphAt(col, offset)
     local g = col.glyphs[offset]
     if not g then
-        g = GLYPHS:sub(math.random(1, #GLYPHS), math.random(1, #GLYPHS))
-        if g == "" then g = "0" end
+        -- BUG (found in-game): using two independent math.random() calls for
+        -- sub()'s start/end produced a random-length RUN of characters, not
+        -- a single glyph -- most "glyphs" were actually several characters
+        -- wide, which is why they spilled clean through the exclusion
+        -- zones and wiped out the title/buttons. One shared index fixes it.
+        local idx = math.random(1, #GLYPHS)
+        g = GLYPHS:sub(idx, idx)
         col.glyphs[offset] = g
     end
     return g
