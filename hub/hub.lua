@@ -217,17 +217,23 @@ local function runVideoMenu()
                 basalt.stop()
             end)
 
-        -- Idle timeout: any key or touch resets the clock; a background
-        -- coroutine stops the UI once it's been quiet too long.
-        local lastActivity = os.epoch("utc")
-        local function touch() lastActivity = os.epoch("utc") end
-        basalt.onEvent("monitor_touch", touch)
-        basalt.onEvent("key", touch)
-
+        -- Idle timeout: plain os.pullEvent polling, not a Basalt event hook
+        -- -- basalt.onEvent/removeEvent turned out not to exist in the
+        -- installed (minified) build despite being in the docs (confirmed
+        -- in-game: "attempt to call field 'onEvent' (a nil value)"). CC
+        -- broadcasts every event to all coroutines waiting on pullEvent,
+        -- Basalt's own included, so this runs alongside it safely.
         basalt.schedule(function()
+            local lastActivity = os.epoch("utc")
             local timeoutMs = (config.VIDEO_MENU_IDLE_TIMEOUT_SEC or 150) * 1000
             while true do
-                sleep(5)
+                local timerId = os.startTimer(5)
+                repeat
+                    local event, p1 = os.pullEvent()
+                    if event == "monitor_touch" or event == "key" or event == "char" or event == "mouse_click" then
+                        lastActivity = os.epoch("utc")
+                    end
+                until event == "timer" and p1 == timerId
                 if os.epoch("utc") - lastActivity > timeoutMs then
                     exitReason = exitReason or "idle"
                     basalt.stop()
@@ -237,8 +243,6 @@ local function runVideoMenu()
         end)
 
         basalt.run()
-        basalt.removeEvent("monitor_touch", touch)
-        basalt.removeEvent("key", touch)
 
         if selectedVideo then
             videoplayer.play(mon, speakers, selectedVideo, config)
