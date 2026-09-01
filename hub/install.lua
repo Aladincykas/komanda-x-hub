@@ -1,5 +1,11 @@
 -- install.lua -- run this once in-game (on the Computer wired to your
--- monitor + speakers) to pull down the whole hub/ folder from GitHub.
+-- monitor + speakers) to pull down the whole hub/ folder from GitHub,
+-- Basalt included. Basalt's OWN installer (wget run
+-- basalt.madefor.cc/2.5/install.lua) is NOT used here -- that domain isn't
+-- on this server's http.rules allowlist (only github.com/githubusercontent
+-- etc are, same restriction the original jukebox README documents), so
+-- basalt.lua is vendored straight into this repo's hub/ folder and fetched
+-- from raw.githubusercontent.com like everything else.
 --
 -- Setup: push this project's hub/ folder to its own GitHub repo (public),
 -- then edit HUB_REPO below to match. Then in-game:
@@ -16,6 +22,7 @@ local FILES = {
     "videoplayer.lua",
     "musicplayer.lua",
     "hub.lua",
+    "basalt.lua",
     "vendor/32vid-decode.lua",
 }
 
@@ -40,15 +47,6 @@ if not fs.exists("hub/vendor") then fs.makeDir("hub/vendor") end
 for _, relPath in ipairs(FILES) do
     print("  " .. relPath)
     download(BASE_URL .. relPath, "hub/" .. relPath)
-end
-
-print("\nInstalling Basalt 2.5 into /hub ...")
-shell.setDir("hub")
-shell.run("wget run https://basalt.madefor.cc/2.5/install.lua minified")
-shell.setDir("/")
-if not fs.exists("hub/basalt.lua") then
-    print("WARNING: hub/basalt.lua wasn't found after running the Basalt installer.")
-    print("Run this manually: cd hub, then wget run https://basalt.madefor.cc/2.5/install.lua minified")
 end
 
 local startup = fs.open("startup.lua", "w")
