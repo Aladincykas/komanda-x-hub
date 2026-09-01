@@ -110,6 +110,17 @@ local function runMainMenu()
             basalt.stop()
         end)
 
+    -- Basalt only repaints a widget's own cells when one of its properties
+    -- changes -- it does not continuously redraw the whole frame. So the
+    -- matrix rain must never write into a cell a widget owns, or it
+    -- permanently erases it the first time it passes through (confirmed
+    -- in-game). Every widget's rectangle above must be listed here.
+    matrix:setExclusions({
+        { tx, titleY, tx + #spaced - 1, titleY },
+        { bx, menuTop, bx + buttonW - 1, menuTop },
+        { bx, menuTop + 2, bx + buttonW - 1, menuTop + 2 },
+    })
+
     -- Background matrix rain, redrawn continuously behind the frame's
     -- widgets while Basalt's own event loop is running.
     basalt.schedule(function()
