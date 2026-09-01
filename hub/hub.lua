@@ -74,7 +74,13 @@ local function runMainMenu()
     local matrix = Matrix.new(mon)
     local chosen = nil
 
-    local frame = basalt.createFrame():setTerm(mon)
+    -- MUST pass mon directly to createFrame (not createFrame():setTerm(mon))
+    -- -- createFrame(t) resolves peripheral.getName(t) into the frame's
+    -- internal "monitor" field, which is what routes monitor_touch events
+    -- to this frame at all. setTerm() alone never sets that field, so
+    -- clicks silently do nothing (confirmed by reading basalt.lua directly
+    -- after in-game testing showed clicks never registering).
+    local frame = basalt.createFrame(mon)
     frame:setBackground(colors.black)
 
     local titleY = math.max(2, math.floor(h * 0.28))
@@ -174,17 +180,34 @@ local function runMainMenu()
     return chosen or "video"
 end
 
+-- basalt.createFrame() appends to a module-level list with no matching
+-- "destroy the frame" call anywhere in this codebase, and its click router
+-- (basalt.lua ~118-125) dispatches monitor_touch to EVERY frame whose
+-- .monitor field matches, with no break -- so calling createFrame() again
+-- on every loop pass (once per video watched) would leak one frame per
+-- video, each one still receiving future clicks forever. This clears a
+-- frame's own children (same pattern Container:destroy() uses internally,
+-- minus destroying the frame itself) so one frame can be reused instead.
+local function clearFrameChildren(frame)
+    local children = rawget(frame, "_children")
+    while children and #children > 0 do
+        local child = children[#children]
+        if child.destroy then child:destroy() end
+        if children[#children] == child then frame:removeChild(child) end
+    end
+end
+
 -- ==== Video selection menu ====
 local function runVideoMenu()
     local videoplayer = require("videoplayer") -- loaded on first entry to this screen only
     local exitReason = nil
+    local frame = basalt.createFrame(mon) -- see the note in runMainMenu above; created ONCE and reused
+    frame:setBackground(colors.black)
 
     while not exitReason do
+        clearFrameChildren(frame)
         local videos = fetchMergedManifest(videoManifestUrls(), "videos.json")
         local selectedVideo = nil
-
-        local frame = basalt.createFrame():setTerm(mon)
-        frame:setBackground(colors.black)
 
         frame:addLabel()
             :setText("SELECT A VIDEO")

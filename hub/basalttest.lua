@@ -16,8 +16,13 @@ mon.setTextScale(config.MONITOR_TEXT_SCALE)
 local w, h = mon.getSize()
 print(("mon size = %dx%d"):format(w, h))
 
-local frame = basalt.createFrame():setTerm(mon)
-print("frame = " .. tostring(frame))
+-- Root cause found by reading basalt.lua directly: createFrame(t) resolves
+-- peripheral.getName(t) into the frame's "monitor" field, which is what
+-- routes monitor_touch events to it at all. createFrame():setTerm(mon)
+-- (the pattern shown in Basalt's own docs) never sets that field, so
+-- clicks silently do nothing no matter what. Must pass mon directly.
+local frame = basalt.createFrame(mon)
+print("frame = " .. tostring(frame) .. "  frame.monitor = " .. tostring(rawget(frame, "monitor")))
 frame:setBackground(colors.black)
 
 frame:addLabel()
