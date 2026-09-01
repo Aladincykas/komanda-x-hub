@@ -5,8 +5,13 @@
 return {
     TITLE = "Komanda X",
 
-    -- Peripheral names, as shown by `peripheral.getNames()` in-game.
-    MONITOR_NAME = "monitor_295",
+    -- Peripheral identifier for the monitor. If it's directly attached to
+    -- the Computer (no wired modem in between), use the side it's touching:
+    -- "back" | "front" | "left" | "right" | "top" | "bottom" -- both work
+    -- with peripheral.wrap the same way. Use the network name (e.g.
+    -- "monitor_295", as shown by `peripheral.getNames()`) if it's reached
+    -- through a modem instead.
+    MONITOR_NAME = "back",
     MONITOR_TEXT_SCALE = 0.5, -- tune until monitor.getSize() reports 71 x 40
 
     GITHUB_USER = "Aladincykas",
