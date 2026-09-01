@@ -11,6 +11,10 @@
 -- without exclusions, the very first matrix tick erased the title and
 -- both menu buttons and Basalt never repainted them). setExclusions()
 -- must be called with every widget's cell rectangle before step() runs.
+--
+-- Plain one-directional fall, no back-and-forth reversal -- an earlier
+-- version alternated fall/rise, which read as the screen "resetting" and
+-- was asked to be reverted to normal matrix-style rain.
 
 local GLYPHS = "01ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%&*+-/<>=?"
 
@@ -47,35 +51,21 @@ function Matrix:isExcluded(x, y)
     return false
 end
 
--- Each column reverses direction on its OWN random timer, not all at once
--- on a shared global clock -- a synchronized whole-field flip (the
--- earlier version) looked like the screen "resetting" every 9 seconds,
--- reported in-game as a visible flash/glitch. Staggering it per-column
--- reads as continuous, organic "loops back and forth" motion instead,
--- with no single moment where anything jumps.
 function Matrix:newColumn(x, randomStart)
     local h = self.h
-    local dir = (math.random() < 0.5) and 1 or -1
     return {
         x = x,
-        dir = dir,
-        y = randomStart and math.random(1, h) or (dir == 1 and 0 or h + 1),
-        len = math.random(4, math.max(5, math.floor(h / 2))),
+        y = randomStart and math.random(1, h) or 0,
+        len = math.random(2, math.max(3, math.floor(h / 4))), -- shorter trails = "smaller" look
         speed = 0.6 + math.random() * 0.9, -- rows per second
         accum = 0,
         glyphs = {},
-        flipIn = 4 + math.random() * 10, -- seconds until THIS column reverses
     }
 end
 
 local function glyphAt(col, offset)
     local g = col.glyphs[offset]
     if not g then
-        -- BUG (found in-game): using two independent math.random() calls for
-        -- sub()'s start/end produced a random-length RUN of characters, not
-        -- a single glyph -- most "glyphs" were actually several characters
-        -- wide, which is why they spilled clean through the exclusion
-        -- zones and wiped out the title/buttons. One shared index fixes it.
         local idx = math.random(1, #GLYPHS)
         g = GLYPHS:sub(idx, idx)
         col.glyphs[offset] = g
@@ -95,11 +85,10 @@ end
 
 function Matrix:drawColumn(col)
     local mon = self.mon
-    local dir = col.dir
     local headY = math.floor(col.y)
 
     for i = 0, col.len do
-        local y = headY - dir * i
+        local y = headY - i
         if y >= 1 and y <= self.h and not self:isExcluded(col.x, y) then
             mon.setCursorPos(col.x, y)
             if i == 0 then
@@ -114,7 +103,7 @@ function Matrix:drawColumn(col)
     end
 
     -- erase the cell just past the tail so the trail doesn't smear
-    local eraseY = headY - dir * (col.len + 1)
+    local eraseY = headY - (col.len + 1)
     if eraseY >= 1 and eraseY <= self.h and not self:isExcluded(col.x, eraseY) then
         mon.setCursorPos(col.x, eraseY)
         mon.write(" ")
@@ -126,28 +115,12 @@ end
 function Matrix:step(dt)
     for x = 1, self.w do
         local col = self.columns[x]
-
-        col.flipIn = col.flipIn - dt
-        if col.flipIn <= 0 then
-            -- Wipe THIS column's current trail before reversing it, using
-            -- its old direction -- without this, the trail drawn under the
-            -- old direction is never fully erased (drawColumn only ever
-            -- erases one cell past the tail per tick) and leftover glyphs
-            -- sit frozen on screen right at the flip point.
-            self:clearColumnCells(col, 1, self.h)
-            col.dir = -col.dir
-            col.flipIn = 4 + math.random() * 10
-            col.glyphs = {}
-        end
-
         col.accum = col.accum + dt * col.speed
         while col.accum >= 1 do
             col.accum = col.accum - 1
-            col.y = col.y + col.dir
+            col.y = col.y + 1
             col.glyphs = {} -- re-roll glyphs each step for the classic "flicker"
-            local offEdge = (col.dir == 1 and col.y - col.len > self.h)
-                or (col.dir == -1 and col.y + col.len < 1)
-            if offEdge then
+            if col.y - col.len > self.h then
                 self:clearColumnCells(col, 1, self.h)
                 self.columns[x] = self:newColumn(x, false)
                 col = self.columns[x]
