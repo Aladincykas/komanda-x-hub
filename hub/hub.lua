@@ -83,20 +83,25 @@ local function runMainMenu()
     local frame = basalt.createFrame(mon)
     frame:setBackground(colors.black)
 
-    local titleY = math.max(2, math.floor(h * 0.28))
     local title = config.TITLE:upper()
     local spaced = title:gsub(".", "%1 "):sub(1, -2) -- letter-spaced for a "big" look on a 1-row font
+    local buttonW = math.min(w - 4, 24)
+
+    -- Whole menu (title + gap + 2 buttons) centered as one block, rather
+    -- than an arbitrary "28% down" title with buttons hanging off it.
+    local BLOCK_HEIGHT = 6 -- title(1) + gap(2) + button(1) + gap(1) + button(1)
+    local blockTop = math.max(2, math.floor((h - BLOCK_HEIGHT) / 2) + 1)
+    local titleY = blockTop
+    local menuTop = titleY + 3
+
     local tx = math.max(1, math.floor((w - #spaced) / 2) + 1)
+    local bx = math.floor((w - buttonW) / 2) + 1
 
     frame:addLabel()
         :setText(spaced)
         :setPosition(tx, titleY)
         :setForeground(colors.yellow)
         :setBackground(colors.black)
-
-    local buttonW = math.min(w - 4, 24)
-    local bx = math.floor((w - buttonW) / 2) + 1
-    local menuTop = titleY + 3
 
     frame:addButton()
         :setText("VIDEO PLAYER")
@@ -120,15 +125,25 @@ local function runMainMenu()
             basalt.stop()
         end)
 
+    -- Force the very first real render now, before the matrix starts
+    -- ticking below -- basalt.schedule() runs its function immediately
+    -- (up to its first yield), so without this the matrix's first step
+    -- could run before Basalt has ever actually flushed the title/buttons
+    -- to the monitor.
+    frame:draw()
+
     -- Basalt only repaints a widget's own cells when one of its properties
     -- changes -- it does not continuously redraw the whole frame. So the
     -- matrix rain must never write into a cell a widget owns, or it
     -- permanently erases it the first time it passes through (confirmed
-    -- in-game). Every widget's rectangle above must be listed here.
+    -- in-game). A 1-cell padding margin keeps the rain from crowding right
+    -- up against the text too. Every widget's rectangle above must be
+    -- listed here.
+    local PAD = 1
     matrix:setExclusions({
-        { tx, titleY, tx + #spaced - 1, titleY },
-        { bx, menuTop, bx + buttonW - 1, menuTop },
-        { bx, menuTop + 2, bx + buttonW - 1, menuTop + 2 },
+        { tx - PAD, titleY, tx + #spaced - 1 + PAD, titleY },
+        { bx - PAD, menuTop - PAD, bx + buttonW - 1 + PAD, menuTop + PAD },
+        { bx - PAD, menuTop + 2 - PAD, bx + buttonW - 1 + PAD, menuTop + 2 + PAD },
     })
 
     -- Background matrix rain, redrawn continuously behind the frame's
@@ -244,6 +259,8 @@ local function runVideoMenu()
                 exitReason = "menu"
                 basalt.stop()
             end)
+
+        frame:draw() -- force the first real render before any schedule()d coroutine runs
 
         -- Idle timeout: plain os.pullEvent polling, not a Basalt event hook
         -- -- basalt.onEvent/removeEvent turned out not to exist in the

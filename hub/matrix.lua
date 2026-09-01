@@ -127,13 +127,12 @@ function Matrix:step(dt)
     self.phaseElapsed = self.phaseElapsed + dt
     if self.phaseElapsed >= PHASE_DURATION then
         self.phaseElapsed = 0
+        -- Just flip direction and let every column continue from wherever
+        -- it currently is. The previous version wiped and restarted every
+        -- column here, which is a full-screen blank flash every 9 seconds
+        -- (reported in-game as "it refreshes when it's not full") -- there
+        -- is no need for that at all, columns reverse smoothly on their own.
         self.phase = (self.phase == PHASE_FALL) and PHASE_RISE or PHASE_FALL
-        -- reset columns to start clean from the new edge, avoids a jarring
-        -- jump-cut mid-column when the direction flips.
-        for x = 1, self.w do
-            self:clearColumnCells(self.columns[x], 1, self.h)
-            self.columns[x] = self:newColumn(x, false)
-        end
     end
 
     local dir = self.phase == PHASE_FALL and 1 or -1
