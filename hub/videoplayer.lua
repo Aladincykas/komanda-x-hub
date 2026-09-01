@@ -43,8 +43,21 @@ local function fetchChunkToMemory(url)
 
     local pos = 1
     local file = {}
+    -- Must match real fs.open(path,"rb")'s contract exactly, not just the
+    -- "n bytes as a string" form: file.read() with NO argument returns ONE
+    -- byte AS A NUMBER (0-255) or nil at EOF -- the ANS decoder in
+    -- vendor/32vid-decode.lua reads bit-by-bit this way constantly
+    -- (readDict, readbits). Calling body:sub(pos, pos+n-1) with n=nil
+    -- crashed with "attempt to perform arithmetic" (confirmed in-game) --
+    -- the old decoder never needed the no-argument form, the new one relies
+    -- on it throughout.
     function file.read(n)
         if pos > #body then return nil end
+        if n == nil then
+            local b = body:byte(pos)
+            pos = pos + 1
+            return b
+        end
         local piece = body:sub(pos, pos + n - 1)
         pos = pos + #piece
         return piece
