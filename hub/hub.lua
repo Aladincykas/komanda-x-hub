@@ -87,44 +87,32 @@ local function runMainMenu()
     local spaced = title:gsub(".", "%1 "):sub(1, -2) -- letter-spaced for a "big" look on a 1-row font
     local buttonW = math.min(w - 4, 24)
 
-    -- A real solid panel, not just "cells the rain skips" -- requested
-    -- after the exclusion-only approach still let rain crowd right up
-    -- against the title/buttons.
-    --
-    -- NOTE: this used to be TWO nested addFrame() panels (an outer
-    -- "border" colored frame with an inner black one inset by 1 cell, for
-    -- a visible border ring) but that rendered as a totally blank screen
-    -- in-game, even though clicks still landed in the right place
-    -- (confirmed: the layout math and click routing were fine, only the
-    -- visual output broke) -- i.e. a rendering bug specific to nesting an
-    -- addFrame inside another addFrame in this Basalt build. Down to one
-    -- level of nesting (panel is a direct child of the top-level frame)
-    -- until that's confirmed safe; the border look can come back once
-    -- basic rendering is confirmed working again.
-    local innerW = math.max(#spaced, buttonW) + 4
-    local innerH = 8 -- title(1) + gap(1) + button(1) + gap(1) + button(1) + top/bottom margin(2,1)
-    local panelX = math.max(1, math.floor((w - innerW) / 2) + 1)
-    local panelY = math.max(1, math.floor((h - innerH) / 2) + 1)
+    -- REVERTED: an addFrame-based solid panel (both a double-nested
+    -- border+fill version, and a single-nested flat version) rendered as
+    -- a completely blank screen in-game -- clicks still landed correctly
+    -- on the invisible buttons, confirming layout/click-routing were fine
+    -- and it was a render-only bug with addFrame nesting in this Basalt
+    -- build. Back to plain labels/buttons directly on `frame` (exactly
+    -- what already works on the video list screen) with padded exclusion
+    -- rects for the matrix rain, which is the last confirmed-working
+    -- state. A real bordered box is something to revisit once there's a
+    -- render-safe way to test addFrame in isolation, not guess again from
+    -- a fresh push.
+    local BLOCK_HEIGHT = 6 -- title(1) + gap(2) + button(1) + gap(1) + button(1)
+    local blockTop = math.max(2, math.floor((h - BLOCK_HEIGHT) / 2) + 1)
+    local titleY = blockTop
+    local menuTop = titleY + 3
 
-    local panel = frame:addFrame({
-        x = panelX, y = panelY, width = innerW, height = innerH,
-        background = colors.black,
-    })
+    local tx = math.max(1, math.floor((w - #spaced) / 2) + 1)
+    local bx = math.floor((w - buttonW) / 2) + 1
 
-    -- Everything below is positioned relative to `panel`'s own top-left,
-    -- not the monitor's.
-    local titleY = 2
-    local menuTop = titleY + 2
-    local tx = math.max(1, math.floor((innerW - #spaced) / 2) + 1)
-    local bx = math.max(1, math.floor((innerW - buttonW) / 2) + 1)
-
-    panel:addLabel()
+    frame:addLabel()
         :setText(spaced)
         :setPosition(tx, titleY)
         :setForeground(colors.yellow)
         :setBackground(colors.black)
 
-    panel:addButton()
+    frame:addButton()
         :setText("VIDEO PLAYER")
         :setPosition(bx, menuTop)
         :setSize(buttonW, 1)
@@ -135,7 +123,7 @@ local function runMainMenu()
             basalt.stop()
         end)
 
-    panel:addButton()
+    frame:addButton()
         :setText("MUSIC PLAYER")
         :setPosition(bx, menuTop + 2)
         :setSize(buttonW, 1)
@@ -149,14 +137,21 @@ local function runMainMenu()
     -- Force the very first real render now, before the matrix starts
     -- ticking below -- basalt.schedule() runs its function immediately
     -- (up to its first yield), so without this the matrix's first step
-    -- could run before Basalt has ever actually flushed the panel to the
-    -- monitor.
+    -- could run before Basalt has ever actually flushed the title/buttons
+    -- to the monitor.
     frame:draw()
 
-    -- The whole panel is solid, opaque, and drawn by Basalt, so the
-    -- matrix just needs to avoid that one rectangle entirely.
+    -- Basalt only repaints a widget's own cells when one of its properties
+    -- changes -- it does not continuously redraw the whole frame. So the
+    -- matrix rain must never write into a cell a widget owns, or it
+    -- permanently erases it the first time it passes through. A 1-cell
+    -- padding margin keeps the rain from crowding right up against the
+    -- text too.
+    local PAD = 1
     matrix:setExclusions({
-        { panelX, panelY, panelX + innerW - 1, panelY + innerH - 1 },
+        { tx - PAD, titleY, tx + #spaced - 1 + PAD, titleY },
+        { bx - PAD, menuTop - PAD, bx + buttonW - 1 + PAD, menuTop + PAD },
+        { bx - PAD, menuTop + 2 - PAD, bx + buttonW - 1 + PAD, menuTop + 2 + PAD },
     })
 
     -- Background matrix rain, redrawn continuously behind the frame's
