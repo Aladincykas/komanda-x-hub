@@ -35,6 +35,39 @@ end
 mon.setTextColor(colors.white)
 mon.setBackgroundColor(colors.black)
 
+-- ONE Basalt frame for the whole hub, shared across every screen, instead
+-- of each screen creating its own via basalt.createFrame(mon). Two
+-- separate frame objects wrapping the SAME physical monitor each keep
+-- their own independent "what's already on screen" diff buffer -- Basalt
+-- only flushes cells that changed FROM THAT FRAME's OWN point of view, so
+-- switching from one frame to another leaves the previous frame's pixels
+-- sitting there, since the new frame has no idea they exist and never
+-- decided to repaint over them. Confirmed in-game: the music player (which
+-- used two separate frames, one for the library list and one for Now
+-- Playing) rendered as "a complete mess" that "overwrites to black
+-- screen" when switching between those two screens. One shared frame,
+-- cleared and rebuilt for whatever screen is active (clearFrameChildren
+-- below), avoids this entirely -- exactly the pattern already proven safe
+-- for the video list rebuilding itself after every video watched.
+local mainFrame = basalt.createFrame(mon)
+mainFrame:setBackground(colors.black)
+
+-- basalt.createFrame() appends to a module-level list with no matching
+-- "destroy the frame" call anywhere in this codebase, and its click router
+-- (basalt.lua ~118-125) dispatches monitor_touch to EVERY frame whose
+-- .monitor field matches, with no break -- so this clears a frame's own
+-- children (same pattern Container:destroy() uses internally, minus
+-- destroying the frame itself) so mainFrame can be reused for every
+-- screen instead of leaking a new frame per screen switch.
+local function clearFrameChildren(frame)
+    local children = rawget(frame, "_children")
+    while children and #children > 0 do
+        local child = children[#children]
+        if child.destroy then child:destroy() end
+        if children[#children] == child then frame:removeChild(child) end
+    end
+end
+
 -- ==== Shared: fetch + merge a manifest across a list of repos ====
 local function fetchMergedManifest(urls, manifestFile)
     local items = {}
@@ -70,18 +103,11 @@ local function videoManifestUrls()
 end
 
 -- ==== Main menu ====
-local function runMainMenu()
+local function runMainMenu(frame)
     local matrix = Matrix.new(mon)
     local chosen = nil
 
-    -- MUST pass mon directly to createFrame (not createFrame():setTerm(mon))
-    -- -- createFrame(t) resolves peripheral.getName(t) into the frame's
-    -- internal "monitor" field, which is what routes monitor_touch events
-    -- to this frame at all. setTerm() alone never sets that field, so
-    -- clicks silently do nothing (confirmed by reading basalt.lua directly
-    -- after in-game testing showed clicks never registering).
-    local frame = basalt.createFrame(mon)
-    frame:setBackground(colors.black)
+    clearFrameChildren(frame)
 
     local title = config.TITLE:upper()
     local spaced = title:gsub(".", "%1 "):sub(1, -2) -- letter-spaced for a "big" look on a 1-row font
@@ -203,29 +229,10 @@ local function runMainMenu()
     return chosen or "video"
 end
 
--- basalt.createFrame() appends to a module-level list with no matching
--- "destroy the frame" call anywhere in this codebase, and its click router
--- (basalt.lua ~118-125) dispatches monitor_touch to EVERY frame whose
--- .monitor field matches, with no break -- so calling createFrame() again
--- on every loop pass (once per video watched) would leak one frame per
--- video, each one still receiving future clicks forever. This clears a
--- frame's own children (same pattern Container:destroy() uses internally,
--- minus destroying the frame itself) so one frame can be reused instead.
-local function clearFrameChildren(frame)
-    local children = rawget(frame, "_children")
-    while children and #children > 0 do
-        local child = children[#children]
-        if child.destroy then child:destroy() end
-        if children[#children] == child then frame:removeChild(child) end
-    end
-end
-
 -- ==== Video selection menu ====
-local function runVideoMenu()
+local function runVideoMenu(frame)
     local videoplayer = require("videoplayer") -- loaded on first entry to this screen only
     local exitReason = nil
-    local frame = basalt.createFrame(mon) -- see the note in runMainMenu above; created ONCE and reused
-    frame:setBackground(colors.black)
 
     while not exitReason do
         clearFrameChildren(frame)
@@ -308,11 +315,11 @@ end
 
 -- ==== Top-level state machine ====
 while true do
-    local target = runMainMenu()
+    local target = runMainMenu(mainFrame)
     if target == "video" then
-        runVideoMenu() -- returns on "menu" (Back button) or "idle" -> main menu
+        runVideoMenu(mainFrame) -- returns on "menu" (Back button) or "idle" -> main menu
     else
         local musicplayer = require("musicplayer") -- loaded on first entry to this screen only
-        musicplayer.run(mon, speakers, config) -- returns on "menu" or "idle" -> main menu
+        musicplayer.run(mon, speakers, config, mainFrame) -- returns on "menu" or "idle" -> main menu
     end
 end

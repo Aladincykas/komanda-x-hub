@@ -69,20 +69,23 @@ local function formatTime(seconds)
     return ("%d:%02d"):format(m, s)
 end
 
-function M.run(mon, speakers, config)
+-- `frame` is ONE Basalt frame shared across the whole hub (hub.lua creates
+-- it once via basalt.createFrame(mon) and passes it into every screen).
+-- Two separate frame objects wrapping the same monitor each keep their
+-- own independent redraw buffer -- confirmed in-game: using a separate
+-- libraryFrame and nowPlayingFrame rendered as "a complete mess" that
+-- "overwrites to black screen" when switching between the library and Now
+-- Playing, since switching frames doesn't repaint over the other frame's
+-- leftover pixels. One shared frame, cleared and rebuilt for whichever
+-- screen is active, avoids that entirely.
+function M.run(mon, speakers, config, frame)
     local w, h = mon.getSize()
     local manifestUrls = buildManifestUrls(config)
 
-    local libraryFrame = basalt.createFrame(mon)
-    libraryFrame:setBackground(colors.black)
-    local nowPlayingFrame = basalt.createFrame(mon)
-    nowPlayingFrame:setBackground(colors.black)
-
     -- ==== Now Playing screen ====
-    -- Returns "menu" if the user chose to go back, otherwise nil.
     local function playSong(song)
-        clearFrameChildren(nowPlayingFrame)
-        local f = nowPlayingFrame
+        clearFrameChildren(frame)
+        local f = frame
 
         f:addLabel()
             :setText("NOW PLAYING")
@@ -239,8 +242,8 @@ function M.run(mon, speakers, config)
     local selectedSong = nil -- set by a song button's onClick, read by the loop below AFTER run() returns
 
     local function drawLibrary()
-        clearFrameChildren(libraryFrame)
-        local f = libraryFrame
+        clearFrameChildren(frame)
+        local f = frame
         local totalPages = math.max(1, math.ceil(#songs / perPage))
         if page > totalPages then page = totalPages end
 
@@ -384,7 +387,7 @@ function M.run(mon, speakers, config)
     while not exitReason do
         selectedSong = nil
         drawLibrary()
-        libraryFrame:draw()
+        frame:draw()
         basalt.run()
 
         if selectedSong then
