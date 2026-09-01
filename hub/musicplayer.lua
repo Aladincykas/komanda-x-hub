@@ -83,6 +83,19 @@ function M.run(mon, speakers, config, frame)
     local manifestUrls = buildManifestUrls(config)
 
     -- ==== Now Playing screen ====
+    -- 5-row bar equalizer, old-media-player style: each of the VIZ_COLS
+    -- columns has its own random height 0-5, one addLabel per ROW (not per
+    -- cell -- that would be VIZ_COLS*5 elements, too many for a CC
+    -- computer to push every tick) built by concatenating a character per
+    -- column for that row. CC has no real audio-analysis API, so like the
+    -- original Pocket-Computer jukebox's equalizer this is decorative/
+    -- randomized while playing, not a real spectrum.
+    local VIZ_COLS = math.min(w - 4, 40)
+    local VIZ_ROWS = 5
+    local VIZ_ROW_COLORS = { colors.red, colors.orange, colors.yellow, colors.lime, colors.green } -- top -> bottom
+    local vizHeights = {}
+    for i = 1, VIZ_COLS do vizHeights[i] = 0 end
+
     local function playSong(song)
         clearFrameChildren(frame)
         local f = frame
@@ -91,25 +104,52 @@ function M.run(mon, speakers, config, frame)
             :setText((" NOW PLAYING "):sub(1, w))
             :setSize(w, 1)
             :setPosition(1, 1)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :setBackground(colors.gray)
+
+        -- Whole content block (song name, status, volume, visualizer,
+        -- controls) centered as one unit in the space below the header and
+        -- above the footer button, instead of hugging the top-left with a
+        -- lot of empty black space below (the "very very empty" complaint).
+        local buttonW = math.min(math.floor((w - 6) / 2), 16)
+        local BLOCK_HEIGHT = 3 + 2 + VIZ_ROWS + 2 + 2 -- name/status/vol(3) + gap(2) + viz + gap(2) + 2 button rows(2)
+        local blockTop = math.max(3, math.floor((h - 1 - BLOCK_HEIGHT) / 2) + 1)
+        local nameY = blockTop
+        local statusY = nameY + 1
+        local volY = statusY + 1
+        local vizY = volY + 2
+        local btnRow1Y = vizY + VIZ_ROWS + 2
+        local btnRow2Y = btnRow1Y + 2
+
+        local vizX = math.max(1, math.floor((w - VIZ_COLS) / 2) + 1)
+        local bx = math.max(1, math.floor((w - (buttonW * 2 + 2)) / 2) + 1)
 
         f:addLabel()
             :setText(song.name:sub(1, w - 2))
-            :setPosition(2, 3)
+            :setPosition(math.max(1, math.floor((w - #song.name:sub(1, w - 2)) / 2) + 1), nameY)
             :setForeground(colors.white)
             :setBackground(colors.black)
 
         local statusLabel = f:addLabel()
             :setText("Loading...")
-            :setPosition(2, 5)
+            :setPosition(2, statusY)
             :setForeground(colors.white)
             :setBackground(colors.black)
 
         local volLabel = f:addLabel()
-            :setPosition(2, 7)
-            :setForeground(colors.white)
+            :setPosition(2, volY)
+            :setForeground(colors.lime)
             :setBackground(colors.black)
+
+        local vizRowLabels = {}
+        for r = 1, VIZ_ROWS do
+            vizRowLabels[r] = f:addLabel()
+                :setText((" "):rep(VIZ_COLS))
+                :setSize(VIZ_COLS, 1)
+                :setPosition(vizX, vizY + r - 1)
+                :setForeground(VIZ_ROW_COLORS[r])
+                :setBackground(colors.black)
+        end
 
         local state = {
             paused = false,
@@ -124,14 +164,12 @@ function M.run(mon, speakers, config, frame)
         end
         updateVolLabel()
 
-        local buttonW = math.min(math.floor((w - 6) / 2), 16)
-
         local playPauseBtn = f:addButton()
             :setText("Pause")
-            :setPosition(2, 9)
+            :setPosition(bx, btnRow1Y)
             :setSize(buttonW, 1)
             :setBackground(colors.gray)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :onClick(function(self)
                 state.paused = not state.paused
                 self:setText(state.paused and "Play" or "Pause")
@@ -140,7 +178,7 @@ function M.run(mon, speakers, config, frame)
 
         f:addButton()
             :setText("Stop")
-            :setPosition(4 + buttonW, 9)
+            :setPosition(bx + buttonW + 2, btnRow1Y)
             :setSize(buttonW, 1)
             :setBackground(colors.red)
             :setForeground(colors.white)
@@ -151,10 +189,10 @@ function M.run(mon, speakers, config, frame)
 
         f:addButton()
             :setText("Vol -")
-            :setPosition(2, 11)
+            :setPosition(bx, btnRow2Y)
             :setSize(buttonW, 1)
             :setBackground(colors.gray)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :onClick(function()
                 state.volume = math.max(0, math.floor((state.volume - 0.1) * 10 + 0.5) / 10)
                 updateVolLabel()
@@ -162,10 +200,10 @@ function M.run(mon, speakers, config, frame)
 
         f:addButton()
             :setText("Vol +")
-            :setPosition(4 + buttonW, 11)
+            :setPosition(bx + buttonW + 2, btnRow2Y)
             :setSize(buttonW, 1)
             :setBackground(colors.gray)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :onClick(function()
                 state.volume = math.min(config.MAX_VOLUME, math.floor((state.volume + 0.1) * 10 + 0.5) / 10)
                 updateVolLabel()
@@ -176,7 +214,7 @@ function M.run(mon, speakers, config, frame)
             :setPosition(2, h)
             :setSize(math.min(w - 2, 20), 1)
             :setBackground(colors.gray)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :onClick(function()
                 state.stopRequested = true
                 os.queueEvent("music_control")
@@ -224,7 +262,26 @@ function M.run(mon, speakers, config, frame)
             while true do
                 statusLabel:setText((state.paused and "|| PAUSED  " or "> PLAYING  ") .. formatTime(state.elapsedBytes / 6000))
                 playPauseBtn:setText(state.paused and "Play" or "Pause")
-                sleep(0.5)
+
+                -- Roll new random bar heights (only while actually playing,
+                -- so it goes still on pause instead of animating uselessly)
+                -- and redraw all VIZ_ROWS at once.
+                if not state.paused then
+                    for c = 1, VIZ_COLS do
+                        vizHeights[c] = math.random(0, VIZ_ROWS)
+                    end
+                end
+                for r = 1, VIZ_ROWS do
+                    local chars = {}
+                    for c = 1, VIZ_COLS do
+                        -- row 1 is the TOP of the bar, so a column needs
+                        -- height >= (VIZ_ROWS - r + 1) to reach this row.
+                        chars[c] = (vizHeights[c] >= (VIZ_ROWS - r + 1)) and "#" or " "
+                    end
+                    vizRowLabels[r]:setText(table.concat(chars))
+                end
+
+                sleep(0.3)
             end
         end)
 
@@ -252,7 +309,7 @@ function M.run(mon, speakers, config, frame)
             :setText((" MUSIC LIBRARY "):sub(1, w))
             :setSize(w, 1)
             :setPosition(1, 1)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :setBackground(colors.gray)
 
         if #loadErrors > 0 then
@@ -286,7 +343,7 @@ function M.run(mon, speakers, config, frame)
                         :setPosition(2, contentTop + i * ROW_STEP)
                         :setSize(w - 2, 1)
                         :setBackground(colors.gray)
-                        :setForeground(colors.white)
+                        :setForeground(colors.lime)
                         :onClick(function()
                             -- MUST NOT call playSong() (and its basalt.run())
                             -- directly from here -- we're still inside THIS
@@ -310,7 +367,7 @@ function M.run(mon, speakers, config, frame)
             :setPosition(2, footerRow)
             :setSize(navW, 1)
             :setBackground(colors.gray)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :onClick(function()
                 if page > 1 then page = page - 1 end
                 drawLibrary()
@@ -321,7 +378,7 @@ function M.run(mon, speakers, config, frame)
             :setPosition(4 + navW, footerRow)
             :setSize(navW, 1)
             :setBackground(colors.gray)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :onClick(function()
                 if page < totalPages then page = page + 1 end
                 drawLibrary()
@@ -332,7 +389,7 @@ function M.run(mon, speakers, config, frame)
             :setPosition(6 + navW * 2, footerRow)
             :setSize(navW, 1)
             :setBackground(colors.gray)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :onClick(function()
                 songs, loadErrors = fetchSongs(manifestUrls)
                 page = 1
@@ -344,7 +401,7 @@ function M.run(mon, speakers, config, frame)
             :setPosition(w - math.min(w - 2, 14) + 1, footerRow)
             :setSize(math.min(w - 2, 14), 1)
             :setBackground(colors.gray)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :onClick(function()
                 exitReason = "menu"
                 basalt.stop()

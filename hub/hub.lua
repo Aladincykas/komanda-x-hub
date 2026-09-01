@@ -136,7 +136,7 @@ local function runMainMenu(frame)
     local boxX = math.max(1, math.floor((w - boxW) / 2) + 1)
     local boxY = math.max(1, math.floor((h - boxH) / 2) + 1)
 
-    local BORDER_COLOR = colors.lightGray
+    local BORDER_COLOR = colors.lime -- matches the matrix rain's own accent color
     frame:addLabel()
         :setText(("="):rep(boxW))
         :setPosition(boxX, boxY)
@@ -160,7 +160,7 @@ local function runMainMenu(frame)
     frame:addLabel()
         :setText(spaced)
         :setPosition(tx, titleY)
-        :setForeground(colors.white)
+        :setForeground(colors.lime)
         :setBackground(colors.black)
 
     frame:addButton()
@@ -168,7 +168,7 @@ local function runMainMenu(frame)
         :setPosition(bx, menuTop)
         :setSize(buttonW, 1)
         :setBackground(colors.gray)
-        :setForeground(colors.white)
+        :setForeground(colors.lime)
         :onClick(function()
             chosen = "video"
             basalt.stop()
@@ -179,7 +179,7 @@ local function runMainMenu(frame)
         :setPosition(bx, menuTop + 2)
         :setSize(buttonW, 1)
         :setBackground(colors.gray)
-        :setForeground(colors.white)
+        :setForeground(colors.lime)
         :onClick(function()
             chosen = "music"
             basalt.stop()
@@ -262,7 +262,7 @@ local function runVideoMenu(frame)
             :setText((" SELECT A VIDEO "):sub(1, w))
             :setSize(w, 1)
             :setPosition(1, 1)
-            :setForeground(colors.white)
+            :setForeground(colors.lime)
             :setBackground(colors.gray)
 
         if #videos == 0 then
@@ -276,7 +276,7 @@ local function runVideoMenu(frame)
                 :setPosition(2, 3)
                 :setSize(w - 2, h - 5)
                 :setBackground(colors.black)
-                :setForeground(colors.white)
+                :setForeground(colors.lime)
             for _, v in ipairs(videos) do list:addItem(v.name) end
             list:onSelect(function(_, index)
                 selectedVideo = videos[index]
