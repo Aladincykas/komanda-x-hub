@@ -111,26 +111,47 @@ local function runMainMenu(frame)
 
     local title = config.TITLE:upper()
     local spaced = title:gsub(".", "%1 "):sub(1, -2) -- letter-spaced for a "big" look on a 1-row font
-    local buttonW = math.min(w - 4, 24)
+    local buttonW = math.min(w - 6, 22) -- "slim" -- narrower than before (was up to 24/w-4)
 
-    -- REVERTED: an addFrame-based solid panel (both a double-nested
-    -- border+fill version, and a single-nested flat version) rendered as
-    -- a completely blank screen in-game -- clicks still landed correctly
-    -- on the invisible buttons, confirming layout/click-routing were fine
-    -- and it was a render-only bug with addFrame nesting in this Basalt
-    -- build. Back to plain labels/buttons directly on `frame` (exactly
-    -- what already works on the video list screen) with padded exclusion
-    -- rects for the matrix rain, which is the last confirmed-working
-    -- state. A real bordered box is something to revisit once there's a
-    -- render-safe way to test addFrame in isolation, not guess again from
-    -- a fresh push.
-    local BLOCK_HEIGHT = 6 -- title(1) + gap(2) + button(1) + gap(1) + button(1)
-    local blockTop = math.max(2, math.floor((h - BLOCK_HEIGHT) / 2) + 1)
-    local titleY = blockTop
-    local menuTop = titleY + 3
+    -- A bordered box drawn with plain addLabel border characters (top/
+    -- bottom rule lines, left/right single-char columns), NOT addFrame --
+    -- addFrame nesting rendered as a totally blank screen in-game at any
+    -- depth (confirmed by testing both a double- and single-nested
+    -- version), even though clicks landed fine, so it's a render-only bug
+    -- with addFrame specifically in this Basalt build. Plain labels are
+    -- the same element type already proven working everywhere else.
+    --
+    -- The box's dark interior needs no separate fill: `frame` already
+    -- paints its own solid black background across the whole monitor on
+    -- the forced frame:draw() below, before the matrix ever runs its
+    -- first step -- as long as the box's full rectangle (border AND
+    -- interior gaps) stays inside the matrix's exclusion zone, that black
+    -- fill is never touched again and reads as a solid panel.
+    local boxW = math.max(#spaced, buttonW) + 4
+    local boxH = 7 -- top border(1) title(1) gap(1) button(1) gap(1) button(1) bottom border(1)
+    local boxX = math.max(1, math.floor((w - boxW) / 2) + 1)
+    local boxY = math.max(1, math.floor((h - boxH) / 2) + 1)
 
-    local tx = math.max(1, math.floor((w - #spaced) / 2) + 1)
-    local bx = math.floor((w - buttonW) / 2) + 1
+    local BORDER_COLOR = colors.cyan
+    frame:addLabel()
+        :setText(("="):rep(boxW))
+        :setPosition(boxX, boxY)
+        :setForeground(BORDER_COLOR)
+        :setBackground(colors.black)
+    frame:addLabel()
+        :setText(("="):rep(boxW))
+        :setPosition(boxX, boxY + boxH - 1)
+        :setForeground(BORDER_COLOR)
+        :setBackground(colors.black)
+    for row = boxY + 1, boxY + boxH - 2 do
+        frame:addLabel():setText("|"):setPosition(boxX, row):setForeground(BORDER_COLOR):setBackground(colors.black)
+        frame:addLabel():setText("|"):setPosition(boxX + boxW - 1, row):setForeground(BORDER_COLOR):setBackground(colors.black)
+    end
+
+    local titleY = boxY + 1
+    local menuTop = titleY + 2
+    local tx = boxX + math.max(1, math.floor((boxW - #spaced) / 2))
+    local bx = boxX + math.max(1, math.floor((boxW - buttonW) / 2))
 
     frame:addLabel()
         :setText(spaced)
@@ -142,7 +163,7 @@ local function runMainMenu(frame)
         :setText("VIDEO PLAYER")
         :setPosition(bx, menuTop)
         :setSize(buttonW, 1)
-        :setBackground(colors.gray)
+        :setBackground(colors.blue)
         :setForeground(colors.white)
         :onClick(function()
             chosen = "video"
@@ -153,7 +174,7 @@ local function runMainMenu(frame)
         :setText("MUSIC PLAYER")
         :setPosition(bx, menuTop + 2)
         :setSize(buttonW, 1)
-        :setBackground(colors.gray)
+        :setBackground(colors.magenta)
         :setForeground(colors.white)
         :onClick(function()
             chosen = "music"
@@ -163,21 +184,15 @@ local function runMainMenu(frame)
     -- Force the very first real render now, before the matrix starts
     -- ticking below -- basalt.schedule() runs its function immediately
     -- (up to its first yield), so without this the matrix's first step
-    -- could run before Basalt has ever actually flushed the title/buttons
-    -- to the monitor.
+    -- could run before Basalt has ever actually flushed the box to the
+    -- monitor.
     frame:draw()
 
-    -- Basalt only repaints a widget's own cells when one of its properties
-    -- changes -- it does not continuously redraw the whole frame. So the
-    -- matrix rain must never write into a cell a widget owns, or it
-    -- permanently erases it the first time it passes through. A 1-cell
-    -- padding margin keeps the rain from crowding right up against the
-    -- text too.
-    local PAD = 1
+    -- The whole box (border + interior) needs to be off-limits to the
+    -- rain, not just the individual text cells -- see the note above on
+    -- why the interior doesn't need its own separate fill.
     matrix:setExclusions({
-        { tx - PAD, titleY, tx + #spaced - 1 + PAD, titleY },
-        { bx - PAD, menuTop - PAD, bx + buttonW - 1 + PAD, menuTop + PAD },
-        { bx - PAD, menuTop + 2 - PAD, bx + buttonW - 1 + PAD, menuTop + 2 + PAD },
+        { boxX, boxY, boxX + boxW - 1, boxY + boxH - 1 },
     })
 
     -- Background matrix rain, redrawn continuously behind the frame's
@@ -240,10 +255,11 @@ local function runVideoMenu(frame)
         local selectedVideo = nil
 
         frame:addLabel()
-            :setText("SELECT A VIDEO")
-            :setPosition(2, 1)
-            :setForeground(colors.yellow)
-            :setBackground(colors.black)
+            :setText((" SELECT A VIDEO "):sub(1, w))
+            :setSize(w, 1)
+            :setPosition(1, 1)
+            :setForeground(colors.white)
+            :setBackground(colors.blue)
 
         if #videos == 0 then
             frame:addLabel()
@@ -268,7 +284,7 @@ local function runVideoMenu(frame)
             :setText("Back to Menu")
             :setPosition(2, h)
             :setSize(math.min(w - 2, 16), 1)
-            :setBackground(colors.gray)
+            :setBackground(colors.red)
             :setForeground(colors.white)
             :onClick(function()
                 exitReason = "menu"
