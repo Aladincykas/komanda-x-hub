@@ -21,6 +21,7 @@ local FILES = {
     "matrix.lua",
     "videoplayer.lua",
     "musicplayer.lua",
+    "settings.lua",
     "hub.lua",
     "basalt.lua",
     "vendor/32vid-decode.lua",

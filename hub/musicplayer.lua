@@ -11,6 +11,7 @@
 
 local dfpwm = require("cc.audio.dfpwm")
 local basalt = require("basalt")
+local settings = require("settings")
 
 local M = {}
 
@@ -69,6 +70,28 @@ local function formatTime(seconds)
     return ("%d:%02d"):format(m, s)
 end
 
+-- Use instead of basalt.schedule() everywhere in this file. Plain sleep()
+-- (an os.sleep alias) is just os.pullEvent("timer") under the hood, which
+-- THROWS on a terminate event no matter what filter it's given, and
+-- Basalt resumes scheduled coroutines in reverse registration order -- so
+-- any coroutine using plain sleep() could throw first and abort that
+-- whole resume pass before hub.lua's terminate watcher ever got a turn.
+-- Wrapping every scheduled function's body in its own pcall means each
+-- one independently notices its own termination and cooperatively sets
+-- the shared flag + stops, regardless of Basalt's resume order. See the
+-- matching note in hub.lua next to safeSchedule there.
+local function safeSchedule(fn)
+    return basalt.schedule(function()
+        local ok, err = pcall(fn)
+        if not ok then
+            if tostring(err):find("Terminated") then
+                _G.KOMANDA_TERMINATED = true
+            end
+            pcall(basalt.stop)
+        end
+    end)
+end
+
 -- `frame` is ONE Basalt frame shared across the whole hub (hub.lua creates
 -- it once via basalt.createFrame(mon) and passes it into every screen).
 -- Two separate frame objects wrapping the same monitor each keep their
@@ -111,33 +134,41 @@ function M.run(mon, speakers, config, frame)
         -- controls) centered as one unit in the space below the header and
         -- above the footer button, instead of hugging the top-left with a
         -- lot of empty black space below (the "very very empty" complaint).
+        -- Real gaps (2 rows) between name/status/volume now too, instead
+        -- of them sitting directly on top of each other.
         local buttonW = math.min(math.floor((w - 6) / 2), 16)
-        local BLOCK_HEIGHT = 3 + 2 + VIZ_ROWS + 2 + 2 -- name/status/vol(3) + gap(2) + viz + gap(2) + 2 button rows(2)
+        -- name(1) gap(2) status(1) gap(2) volume(1) gap(3) viz(VIZ_ROWS) gap(2) 4 button rows w/ 1-row gaps(7)
+        local BLOCK_HEIGHT = 1 + 2 + 1 + 2 + 1 + 3 + VIZ_ROWS + 2 + 7
         local blockTop = math.max(3, math.floor((h - 1 - BLOCK_HEIGHT) / 2) + 1)
         local nameY = blockTop
-        local statusY = nameY + 1
-        local volY = statusY + 1
-        local vizY = volY + 2
+        local statusY = nameY + 2
+        local volY = statusY + 2
+        local vizY = volY + 3
         local btnRow1Y = vizY + VIZ_ROWS + 2
         local btnRow2Y = btnRow1Y + 2
+        local btnRow3Y = btnRow2Y + 2
+        local btnRow4Y = btnRow3Y + 2
 
         local vizX = math.max(1, math.floor((w - VIZ_COLS) / 2) + 1)
         local bx = math.max(1, math.floor((w - (buttonW * 2 + 2)) / 2) + 1)
 
-        f:addLabel()
-            :setText(song.name:sub(1, w - 2))
-            :setPosition(math.max(1, math.floor((w - #song.name:sub(1, w - 2)) / 2) + 1), nameY)
+        local function centerLabel(label, y, text, color)
+            label:setText(text)
+            if color then label:setForeground(color) end
+            label:setPosition(math.max(1, math.floor((w - #text) / 2) + 1), y)
+        end
+
+        local nameLabel = f:addLabel()
             :setForeground(colors.white)
             :setBackground(colors.black)
+        centerLabel(nameLabel, nameY, song.name:sub(1, w - 2))
 
         local statusLabel = f:addLabel()
-            :setText("Loading...")
-            :setPosition(2, statusY)
             :setForeground(colors.white)
             :setBackground(colors.black)
+        centerLabel(statusLabel, statusY, "Loading...")
 
         local volLabel = f:addLabel()
-            :setPosition(2, volY)
             :setForeground(colors.lime)
             :setBackground(colors.black)
 
@@ -151,18 +182,34 @@ function M.run(mon, speakers, config, frame)
                 :setBackground(colors.black)
         end
 
+        -- Volume persists across songs/sessions (a saved settings file, not
+        -- an in-memory default) -- it used to reset to config.DEFAULT_VOLUME
+        -- every single time, which was loud and annoying on a public
+        -- installation.
+        local savedSettings = settings.load()
         local state = {
             paused = false,
             stopRequested = false,
             elapsedBytes = 0,
-            volume = config.DEFAULT_VOLUME,
+            volume = savedSettings.musicVolume or config.DEFAULT_VOLUME,
         }
 
         local function updateVolLabel()
             local pct = math.floor(state.volume / config.MAX_VOLUME * 100 + 0.5)
-            volLabel:setText(("Volume: %d%%  (- / + below)"):format(pct))
+            centerLabel(volLabel, volY, ("Volume: %d%%"):format(pct))
         end
         updateVolLabel()
+
+        -- setVolume(delta) where delta is a FRACTION of MAX_VOLUME (e.g.
+        -- 0.05 = "+5%"), not a raw volume unit, since that's how the step
+        -- size was asked for ("every 5 +/-", "every 20 +/-").
+        local function adjustVolume(deltaFraction)
+            local step = deltaFraction * config.MAX_VOLUME
+            state.volume = math.max(0, math.min(config.MAX_VOLUME, state.volume + step))
+            updateVolLabel()
+            savedSettings.musicVolume = state.volume
+            settings.save(savedSettings)
+        end
 
         local playPauseBtn = f:addButton()
             :setText("Pause")
@@ -188,26 +235,52 @@ function M.run(mon, speakers, config, frame)
             end)
 
         f:addButton()
-            :setText("Vol -")
+            :setText("Vol -1%")
             :setPosition(bx, btnRow2Y)
             :setSize(buttonW, 1)
             :setBackground(colors.gray)
             :setForeground(colors.lime)
-            :onClick(function()
-                state.volume = math.max(0, math.floor((state.volume - 0.1) * 10 + 0.5) / 10)
-                updateVolLabel()
-            end)
+            :onClick(function() adjustVolume(-0.01) end)
 
         f:addButton()
-            :setText("Vol +")
+            :setText("Vol +1%")
             :setPosition(bx + buttonW + 2, btnRow2Y)
             :setSize(buttonW, 1)
             :setBackground(colors.gray)
             :setForeground(colors.lime)
-            :onClick(function()
-                state.volume = math.min(config.MAX_VOLUME, math.floor((state.volume + 0.1) * 10 + 0.5) / 10)
-                updateVolLabel()
-            end)
+            :onClick(function() adjustVolume(0.01) end)
+
+        f:addButton()
+            :setText("Vol -5%")
+            :setPosition(bx, btnRow3Y)
+            :setSize(buttonW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function() adjustVolume(-0.05) end)
+
+        f:addButton()
+            :setText("Vol +5%")
+            :setPosition(bx + buttonW + 2, btnRow3Y)
+            :setSize(buttonW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function() adjustVolume(0.05) end)
+
+        f:addButton()
+            :setText("Vol -20%")
+            :setPosition(bx, btnRow4Y)
+            :setSize(buttonW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function() adjustVolume(-0.20) end)
+
+        f:addButton()
+            :setText("Vol +20%")
+            :setPosition(bx + buttonW + 2, btnRow4Y)
+            :setSize(buttonW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function() adjustVolume(0.20) end)
 
         f:addButton()
             :setText("Back to Library")
@@ -222,10 +295,10 @@ function M.run(mon, speakers, config, frame)
 
         f:draw()
 
-        basalt.schedule(function()
+        safeSchedule(function()
             local response, err = http.get(song.url, nil, true)
             if not response then
-                statusLabel:setText("ERROR: " .. tostring(err))
+                centerLabel(statusLabel, statusY, "ERROR: " .. tostring(err))
                 sleep(1.5)
                 basalt.stop()
                 return
@@ -258,9 +331,10 @@ function M.run(mon, speakers, config, frame)
             basalt.stop()
         end)
 
-        basalt.schedule(function()
+        safeSchedule(function()
             while true do
-                statusLabel:setText((state.paused and "|| PAUSED  " or "> PLAYING  ") .. formatTime(state.elapsedBytes / 6000))
+                centerLabel(statusLabel, statusY,
+                    (state.paused and "|| PAUSED  " or "> PLAYING  ") .. formatTime(state.elapsedBytes / 6000))
                 playPauseBtn:setText(state.paused and "Play" or "Pause")
 
                 -- Roll new random bar heights (only while actually playing,
@@ -419,14 +493,22 @@ function M.run(mon, speakers, config, frame)
     -- (rather than relying on the playback coroutine to notice) since
     -- stopping THAT frame's run() loop doesn't by itself stop audio
     -- already queued on the speakers.
-    basalt.schedule(function()
+    -- pullEventRaw here (not plain pullEvent, which throws on terminate) --
+    -- same reasoning as the matching idle-timeout loop in hub.lua's
+    -- runVideoMenu.
+    safeSchedule(function()
         local lastActivity = os.epoch("utc")
         local timeoutMs = (config.MUSIC_MENU_IDLE_TIMEOUT_SEC or 150) * 1000
         while true do
             local timerId = os.startTimer(5)
             repeat
-                local event, p1 = os.pullEvent()
-                if event == "monitor_touch" or event == "key" or event == "char" or event == "mouse_click" then
+                local event, p1 = os.pullEventRaw()
+                if event == "terminate" then
+                    _G.KOMANDA_TERMINATED = true
+                    for _, spk in ipairs(speakers) do pcall(spk.stop) end
+                    basalt.stop()
+                    return
+                elseif event == "monitor_touch" or event == "key" or event == "char" or event == "mouse_click" then
                     lastActivity = os.epoch("utc")
                 end
             until event == "timer" and p1 == timerId
@@ -443,18 +525,18 @@ function M.run(mon, speakers, config, frame)
     -- run the library screen; if a song was picked, play it (its own,
     -- separate basalt.run() call, only reached once THIS run() has fully
     -- returned) then loop back around to the library, fresh.
-    while not exitReason do
+    while not exitReason and not _G.KOMANDA_TERMINATED do
         selectedSong = nil
         drawLibrary()
         frame:draw()
         basalt.run()
 
-        if selectedSong then
+        if selectedSong and not _G.KOMANDA_TERMINATED then
             playSong(selectedSong)
         end
     end
 
-    return exitReason
+    return _G.KOMANDA_TERMINATED and "quit" or exitReason
 end
 
 return M

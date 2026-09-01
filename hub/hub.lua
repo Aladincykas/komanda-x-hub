@@ -52,6 +52,61 @@ mon.setBackgroundColor(colors.black)
 local mainFrame = basalt.createFrame(mon)
 mainFrame:setBackground(colors.black)
 
+-- Ctrl+T ("terminate") STILL couldn't close the program -- traced this by
+-- reading basalt.run() directly: it catches EVERY error internally
+-- (including a "Terminated" error from any of our own code) via xpcall,
+-- and its own event loop treats "terminate" as a normal signal to just
+-- stop *that one* run() call cleanly -- it NEVER re-throws, so run()
+-- always returns normally no matter why it stopped. That means nothing in
+-- our surrounding while-loops could ever tell "the user hit Ctrl+T" apart
+-- from "a button called basalt.stop()", so they just kept looping into
+-- the next screen instead of actually exiting.
+--
+-- Fix: a global flag, set by our OWN watcher coroutine using
+-- os.pullEventRaw (which does NOT throw on terminate, unlike plain
+-- pullEvent), checked after every basalt.run() call at every level
+-- (here, runVideoMenu, and musicplayer.lua's loops) so the exit actually
+-- propagates all the way out instead of stopping at whichever screen
+-- happened to be open. A real Lua global (not `local`) since this needs
+-- to be visible from musicplayer.lua too, a separate module/file. Basalt
+-- schedules persist across separate run() calls (the `schedules` table is
+-- never cleared between them), so this only needs to be registered once,
+-- here, and it keeps working for every screen after this point.
+_G.KOMANDA_TERMINATED = false
+basalt.schedule(function()
+    while true do
+        if os.pullEventRaw() == "terminate" then
+            _G.KOMANDA_TERMINATED = true
+            basalt.stop()
+            return
+        end
+    end
+end)
+
+-- basalt.schedule() should be used through THIS wrapper everywhere in this
+-- codebase, not called directly -- plain sleep() (an os.sleep alias) is
+-- itself just os.pullEvent("timer") under the hood, and pullEvent THROWS
+-- on a terminate event no matter what filter it's given. Basalt resumes
+-- scheduled coroutines in REVERSE registration order, so any coroutine
+-- using plain sleep() (the matrix loop, menu music, the visualizer, etc)
+-- could throw first and abort that whole resume pass before the watcher
+-- above ever got a turn -- i.e. depend on scheduling order to work at
+-- all, which isn't good enough. Wrapping every scheduled function's body
+-- in its own pcall means each one independently notices its own
+-- termination and cooperatively sets the flag + stops, regardless of
+-- what order Basalt happens to resume them in.
+local function safeSchedule(fn)
+    return basalt.schedule(function()
+        local ok, err = pcall(fn)
+        if not ok then
+            if tostring(err):find("Terminated") then
+                _G.KOMANDA_TERMINATED = true
+            end
+            pcall(basalt.stop)
+        end
+    end)
+end
+
 -- basalt.createFrame() appends to a module-level list with no matching
 -- "destroy the frame" call anywhere in this codebase, and its click router
 -- (basalt.lua ~118-125) dispatches monitor_touch to EVERY frame whose
@@ -201,7 +256,7 @@ local function runMainMenu(frame)
 
     -- Background matrix rain, redrawn continuously behind the frame's
     -- widgets while Basalt's own event loop is running.
-    basalt.schedule(function()
+    safeSchedule(function()
         while not chosen do
             matrix:step(0.2)
             sleep(0.2)
@@ -211,7 +266,7 @@ local function runMainMenu(frame)
     -- Main menu music: looks up the configured track name in the merged
     -- music library and loops it at MENU_MUSIC_VOLUME until a selection is
     -- made. Silently does nothing if no track is configured yet.
-    basalt.schedule(function()
+    safeSchedule(function()
         if not config.MENU_MUSIC_NAME then return end
         local dfpwm = require("cc.audio.dfpwm")
         while not chosen do
@@ -245,6 +300,7 @@ local function runMainMenu(frame)
     basalt.run()
 
     for _, speaker in ipairs(speakers) do pcall(speaker.stop) end
+    if _G.KOMANDA_TERMINATED then return "quit" end
     return chosen or "video"
 end
 
@@ -253,7 +309,7 @@ local function runVideoMenu(frame)
     local videoplayer = require("videoplayer") -- loaded on first entry to this screen only
     local exitReason = nil
 
-    while not exitReason do
+    while not exitReason and not _G.KOMANDA_TERMINATED do
         clearFrameChildren(frame)
         local videos = fetchMergedManifest(videoManifestUrls(), "videos.json")
         local selectedVideo = nil
@@ -297,20 +353,34 @@ local function runVideoMenu(frame)
 
         frame:draw() -- force the first real render before any schedule()d coroutine runs
 
-        -- Idle timeout: plain os.pullEvent polling, not a Basalt event hook
-        -- -- basalt.onEvent/removeEvent turned out not to exist in the
-        -- installed (minified) build despite being in the docs (confirmed
-        -- in-game: "attempt to call field 'onEvent' (a nil value)"). CC
-        -- broadcasts every event to all coroutines waiting on pullEvent,
-        -- Basalt's own included, so this runs alongside it safely.
-        basalt.schedule(function()
+        -- Idle timeout: event polling, not a Basalt event hook -- basalt.
+        -- onEvent/removeEvent turned out not to exist in the installed
+        -- (minified) build despite being in the docs (confirmed in-game:
+        -- "attempt to call field 'onEvent' (a nil value)"). CC broadcasts
+        -- every event to all coroutines waiting on pullEvent, Basalt's own
+        -- included, so this runs alongside it safely.
+        --
+        -- Uses pullEventRaw, NOT plain pullEvent -- plain pullEvent THROWS
+        -- on a terminate event regardless of any filter, and Basalt
+        -- resumes scheduled coroutines in REVERSE order, so this one (added
+        -- after the terminate watcher near the top of this file) would get
+        -- resumed FIRST and its error would abort that whole resume pass
+        -- before the watcher ever got a turn -- i.e. Ctrl+T could get
+        -- silently eaten depending on scheduling order. Checking for
+        -- "terminate" explicitly here too means this doesn't depend on
+        -- that ordering at all.
+        safeSchedule(function()
             local lastActivity = os.epoch("utc")
             local timeoutMs = (config.VIDEO_MENU_IDLE_TIMEOUT_SEC or 150) * 1000
             while true do
                 local timerId = os.startTimer(5)
                 repeat
-                    local event, p1 = os.pullEvent()
-                    if event == "monitor_touch" or event == "key" or event == "char" or event == "mouse_click" then
+                    local event, p1 = os.pullEventRaw()
+                    if event == "terminate" then
+                        _G.KOMANDA_TERMINATED = true
+                        basalt.stop()
+                        return
+                    elseif event == "monitor_touch" or event == "key" or event == "char" or event == "mouse_click" then
                         lastActivity = os.epoch("utc")
                     end
                 until event == "timer" and p1 == timerId
@@ -324,22 +394,23 @@ local function runVideoMenu(frame)
 
         basalt.run()
 
-        if selectedVideo then
+        if selectedVideo and not _G.KOMANDA_TERMINATED then
             videoplayer.play(mon, speakers, selectedVideo, config)
             -- loop back around: rebuild the list fresh after playback
         end
     end
 
-    return exitReason
+    return _G.KOMANDA_TERMINATED and "quit" or exitReason
 end
 
 -- ==== Top-level state machine ====
-while true do
+while not _G.KOMANDA_TERMINATED do
     local target = runMainMenu(mainFrame)
+    if target == "quit" or _G.KOMANDA_TERMINATED then break end
     if target == "video" then
-        runVideoMenu(mainFrame) -- returns on "menu" (Back button) or "idle" -> main menu
+        runVideoMenu(mainFrame) -- returns on "menu" (Back button), "idle", or "quit" -> main menu (or exit, below)
     else
         local musicplayer = require("musicplayer") -- loaded on first entry to this screen only
-        musicplayer.run(mon, speakers, config, mainFrame) -- returns on "menu" or "idle" -> main menu
+        musicplayer.run(mon, speakers, config, mainFrame) -- returns on "menu", "idle", or "quit" -> main menu (or exit, below)
     end
 end

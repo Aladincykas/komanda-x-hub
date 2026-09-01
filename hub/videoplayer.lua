@@ -6,6 +6,7 @@
 -- see that file's header comment before touching the decode logic.
 
 local decodeModule = require("vendor.32vid-decode")
+local settings = require("settings")
 
 local M = {}
 
@@ -94,10 +95,14 @@ end
 -- the video/music list screens time out).
 function M.play(mon, speakers, entry, config)
     local w, h = mon.getSize()
+    -- Volume persists across videos/sessions (same fix as the music
+    -- player) instead of resetting to config.DEFAULT_VOLUME -- and loud --
+    -- every single time.
+    local savedSettings = settings.load()
     local state = {
         paused = false,
         stopRequested = false,
-        volume = config.DEFAULT_VOLUME,
+        volume = savedSettings.videoVolume or config.DEFAULT_VOLUME,
         maxVolume = config.MAX_VOLUME,
         elapsedSec = 0,
     }
@@ -184,8 +189,12 @@ function M.play(mon, speakers, entry, config)
                             os.queueEvent("video_control")
                         elseif key == keys.left then
                             state.volume = math.max(0, math.floor((state.volume - 0.1) * 10 + 0.5) / 10)
+                            savedSettings.videoVolume = state.volume
+                            settings.save(savedSettings)
                         elseif key == keys.right then
                             state.volume = math.min(state.maxVolume, math.floor((state.volume + 0.1) * 10 + 0.5) / 10)
+                            savedSettings.videoVolume = state.volume
+                            settings.save(savedSettings)
                         end
                     end
                 end
