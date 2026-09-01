@@ -87,23 +87,27 @@ local function runMainMenu()
     local spaced = title:gsub(".", "%1 "):sub(1, -2) -- letter-spaced for a "big" look on a 1-row font
     local buttonW = math.min(w - 4, 24)
 
-    -- A real solid bordered panel, not just "cells the rain skips" --
-    -- requested after the exclusion-only approach still let rain crowd
-    -- right up against the title/buttons. Classic terminal-UI border
-    -- trick: a slightly bigger colored frame, with a black frame inset by
-    -- 1 cell on top of it, leaving a visible 1-cell-thick border ring.
+    -- A real solid panel, not just "cells the rain skips" -- requested
+    -- after the exclusion-only approach still let rain crowd right up
+    -- against the title/buttons.
+    --
+    -- NOTE: this used to be TWO nested addFrame() panels (an outer
+    -- "border" colored frame with an inner black one inset by 1 cell, for
+    -- a visible border ring) but that rendered as a totally blank screen
+    -- in-game, even though clicks still landed in the right place
+    -- (confirmed: the layout math and click routing were fine, only the
+    -- visual output broke) -- i.e. a rendering bug specific to nesting an
+    -- addFrame inside another addFrame in this Basalt build. Down to one
+    -- level of nesting (panel is a direct child of the top-level frame)
+    -- until that's confirmed safe; the border look can come back once
+    -- basic rendering is confirmed working again.
     local innerW = math.max(#spaced, buttonW) + 4
     local innerH = 8 -- title(1) + gap(1) + button(1) + gap(1) + button(1) + top/bottom margin(2,1)
-    local borderW, borderH = innerW + 2, innerH + 2
-    local borderX = math.max(1, math.floor((w - borderW) / 2) + 1)
-    local borderY = math.max(1, math.floor((h - borderH) / 2) + 1)
+    local panelX = math.max(1, math.floor((w - innerW) / 2) + 1)
+    local panelY = math.max(1, math.floor((h - innerH) / 2) + 1)
 
-    local border = frame:addFrame({
-        x = borderX, y = borderY, width = borderW, height = borderH,
-        background = colors.yellow,
-    })
-    local panel = border:addFrame({
-        x = 2, y = 2, width = innerW, height = innerH,
+    local panel = frame:addFrame({
+        x = panelX, y = panelY, width = innerW, height = innerH,
         background = colors.black,
     })
 
@@ -149,12 +153,10 @@ local function runMainMenu()
     -- monitor.
     frame:draw()
 
-    -- The whole bordered box is solid, opaque, and drawn by Basalt, so the
-    -- matrix just needs to avoid that one rectangle entirely -- no more
-    -- crowding-the-text problem, since there's no text cells to crowd,
-    -- just one clean box.
+    -- The whole panel is solid, opaque, and drawn by Basalt, so the
+    -- matrix just needs to avoid that one rectangle entirely.
     matrix:setExclusions({
-        { borderX, borderY, borderX + borderW - 1, borderY + borderH - 1 },
+        { panelX, panelY, panelX + innerW - 1, panelY + innerH - 1 },
     })
 
     -- Background matrix rain, redrawn continuously behind the frame's
