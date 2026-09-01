@@ -141,9 +141,16 @@ end
 
 -- lastPalette (a {r,g,b} per color, mutated in place) lets this skip a
 -- setPaletteColor call for any color that didn't actually change since the
--- previous frame -- one more cut at the render cost that was overloading
--- the physical monitor (see the fps-cap note above DEFAULT_FPS_CAP).
-local function drawFrame(mon, image, lastPalette)
+-- previous frame. lastRows (a {text,fg,bg} per row, mutated in place) does
+-- the same for mon.blit -- skip rows that are byte-for-byte identical to
+-- what's already on screen. Capping fps alone didn't fix the physical
+-- monitor corrupting (confirmed in-game even at 10fps), which points at
+-- total data per redraw being the real cost, not calls-per-second -- a
+-- video like Bad Apple has large static black/white regions, so most rows
+-- often don't change between consecutive frames at all. This keeps full
+-- resolution (no downgrade) while cutting actual blit throughput based on
+-- what's really different, frame to frame.
+local function drawFrame(mon, image, lastPalette, lastRows)
     for i, v in ipairs(image.palette) do
         local prev = lastPalette[i]
         if not prev or prev[1] ~= v[1] or prev[2] ~= v[2] or prev[3] ~= v[3] then
@@ -152,8 +159,12 @@ local function drawFrame(mon, image, lastPalette)
         end
     end
     for y, r in ipairs(image) do
-        mon.setCursorPos(1, y)
-        mon.blit(table.unpack(r))
+        local prevRow = lastRows[y]
+        if not prevRow or prevRow[1] ~= r[1] or prevRow[2] ~= r[2] or prevRow[3] ~= r[3] then
+            mon.setCursorPos(1, y)
+            mon.blit(r[1], r[2], r[3])
+            lastRows[y] = r
+        end
     end
 end
 
@@ -223,6 +234,7 @@ function M.play(mon, speakers, entry, config)
                     local start = os.epoch("utc")
                     local f = 1
                     local lastPalette = {}
+                    local lastRows = {}
                     while f <= nFrames and not state.stopRequested do
                         while state.paused and not state.stopRequested do
                             os.pullEvent("video_control")
@@ -230,7 +242,7 @@ function M.play(mon, speakers, entry, config)
                         end
                         if state.stopRequested then break end
 
-                        drawFrame(mon, decoded.video[f], lastPalette)
+                        drawFrame(mon, decoded.video[f], lastPalette, lastRows)
                         state.elapsedSec = cumulativeSec + (f - 1) / fps
                         drawControls(mon, w, h, state, entry.durationSec or 0, buttons)
 
@@ -242,41 +254,38 @@ function M.play(mon, speakers, entry, config)
                     end
                     cumulativeSec = cumulativeSec + nFrames / fps
                 end,
-                function() -- audio, fanned out to every networked speaker
+                function() -- audio, paced by wall-clock time, fanned out to every speaker
+                    -- Fire-and-forget to every networked speaker at the
+                    -- correct REAL TIME moment, instead of the previous
+                    -- design where each speaker independently waited for
+                    -- its own speaker_audio_empty acknowledgment before
+                    -- advancing. Each speaker.playAudio call and its "done"
+                    -- signal is a real network round-trip -- with dozens of
+                    -- networked speakers (confirmed: this installation has
+                    -- that many) all being fed this way, that per-call
+                    -- latency compounded independently per speaker and the
+                    -- whole mix drifted further out of sync the longer
+                    -- playback ran (confirmed in-game). Pacing dispatch
+                    -- against a wall clock instead of per-speaker feedback
+                    -- removes that compounding entirely: if one speaker's
+                    -- buffer is still busy when its turn comes, that one
+                    -- chunk is just dropped for that speaker (a small
+                    -- glitch) rather than the whole video waiting on it.
                     if not decoded.audio or #speakers == 0 then return end
-                    local funcs = {}
-                    for _, speaker in ipairs(speakers) do
-                        funcs[#funcs + 1] = function()
-                            for _, chunk in ipairs(decoded.audio) do
-                                if state.stopRequested then break end
-                                -- Timeout on speaker_audio_empty, NOT an
-                                -- unbounded wait -- with many networked
-                                -- speakers (confirmed: this installation
-                                -- has dozens), if even ONE never fires that
-                                -- event (out of range, disconnected,
-                                -- whatever), the whole video froze forever
-                                -- waiting on it (confirmed in-game: playback
-                                -- stuck at a fixed elapsed time with no
-                                -- error). After 3s of no response from THIS
-                                -- speaker, just move on instead of hanging.
-                                while not state.stopRequested and not speaker.playAudio(chunk, state.volume) do
-                                    local timerId = os.startTimer(3)
-                                    local gaveUp = false
-                                    repeat
-                                        local ev, a, b = os.pullEvent()
-                                        if ev == "speaker_audio_empty" and a == peripheral.getName(speaker) then
-                                            break
-                                        elseif ev == "timer" and a == timerId then
-                                            gaveUp = true
-                                            break
-                                        end
-                                    until state.stopRequested
-                                    if gaveUp or state.stopRequested then break end
-                                end
-                            end
+                    local audioStart = os.epoch("utc")
+                    for i, chunk in ipairs(decoded.audio) do
+                        if state.stopRequested then break end
+                        for _, speaker in ipairs(speakers) do
+                            pcall(speaker.playAudio, chunk, state.volume)
+                        end
+                        -- Each decoded audio chunk is ~1 real second
+                        -- (DFPWM: 6000 bytes/sec post-decode; raw PCM:
+                        -- 48000 bytes/sec), so the i-th chunk should start
+                        -- at audioStart + i seconds.
+                        while not state.stopRequested and os.epoch("utc") < audioStart + i * 1000 do
+                            os.sleep(0.05)
                         end
                     end
-                    parallel.waitForAll(table.unpack(funcs))
                 end,
                 function() -- input handling: keyboard (at the Computer) and touch (at the monitor)
                     while not state.stopRequested do
