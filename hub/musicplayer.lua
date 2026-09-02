@@ -241,8 +241,31 @@ function M.run(mon, speakers, config, frame)
     -- so one dead speaker can't stall the others). Same dispatch pattern
     -- used everywhere else in this project (hub.lua's menu music,
     -- videoplayer.lua's audio dispatcher).
+    --
+    -- Periodic hard resync: waiting for EVERY speaker before returning
+    -- only synchronizes when OUR code moves on to the next chunk -- it
+    -- doesn't undo a speaker's actual SOUND having started a little late
+    -- if it had to wait for an ack this chunk while every other speaker
+    -- succeeded immediately. Nothing corrects that gap once it happens,
+    -- so if even one speaker occasionally has to wait, it keeps drifting
+    -- further behind, chunk after chunk -- confirmed in-game: speakers
+    -- audibly out of sync with each other, worsening over the course of a
+    -- song rather than being off from the very start. Every
+    -- RESYNC_EVERY_N_CHUNKS chunks (~10, ~27s of audio), stop every
+    -- speaker and restart them on the SAME chunk together, forcing them
+    -- back into alignment -- trades a small audible blip at each resync
+    -- point for drift that's capped at one resync interval instead of
+    -- growing for the whole song.
+    local RESYNC_EVERY_N_CHUNKS = 10
     local function dispatchToSpeakers(state, buffer)
         if #speakers == 0 then return end
+
+        state.chunksSinceResync = (state.chunksSinceResync or 0) + 1
+        if state.chunksSinceResync >= RESYNC_EVERY_N_CHUNKS then
+            state.chunksSinceResync = 0
+            for _, speaker in ipairs(speakers) do pcall(speaker.stop) end
+        end
+
         local funcs = {}
         for _, speaker in ipairs(speakers) do
             funcs[#funcs + 1] = function()
