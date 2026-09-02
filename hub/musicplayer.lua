@@ -188,17 +188,25 @@ function M.run(mon, speakers, config, frame)
 
     -- ==== Now Playing screen ====
     -- Bar equalizer, old-media-player style: each column has its own
-    -- random height, one addLabel per ROW (not per cell -- that would be
+    -- height, one addLabel per ROW (not per cell -- that would be
     -- COLS*ROWS elements, too many for a CC computer to push every tick)
     -- built by concatenating a character per column for that row. CC has
     -- no real audio-analysis API, so like the original Pocket-Computer
-    -- jukebox's equalizer this is decorative/randomized while playing, not
-    -- a real spectrum.
-    local VIZ_COLS = math.min(w - 4, 40)
-    local COMPACT_VIZ_ROWS = 5
-    local VIZ_ROW_COLORS = { colors.red, colors.orange, colors.yellow, colors.lime, colors.green, colors.green } -- top -> bottom, last repeats if immersive needs more rows than this list
+    -- jukebox's equalizer this is decorative, not a real spectrum.
+    --
+    -- Compact mode keeps its original narrower width; immersive mode gets
+    -- a noticeably wider one too (not just taller), since "bigger visuals"
+    -- means using the freed horizontal room as well, not just vertical.
+    -- COMPACT_VIZ_ROWS now scales with the monitor's height instead of a
+    -- flat 5, so compact mode doesn't leave a big dead gap of empty space
+    -- between the buttons and the bottom of the screen.
+    local COMPACT_VIZ_COLS = math.min(w - 4, 40)
+    local IMMERSIVE_VIZ_COLS = math.min(w - 4, 66)
+    local MAX_VIZ_COLS = math.max(COMPACT_VIZ_COLS, IMMERSIVE_VIZ_COLS)
+    local COMPACT_VIZ_ROWS = math.max(5, math.floor(h * 0.3))
+    local VIZ_ROW_COLORS = { colors.red, colors.orange, colors.yellow, colors.lime, colors.green, colors.green } -- top -> bottom, last repeats if a mode needs more rows than this list
     local vizHeights = {}
-    for i = 1, VIZ_COLS do vizHeights[i] = 0 end
+    for i = 1, MAX_VIZ_COLS do vizHeights[i] = 0 end
 
     -- 1 minute of no touch on the Now Playing screen hides the controls
     -- and grows the equalizer to fill the freed space -- confirmed
@@ -224,8 +232,21 @@ function M.run(mon, speakers, config, frame)
         -- never stale references from a mode that's since been rebuilt
         -- away. playPauseBtn/volLabel are nil while immersive (no buttons
         -- exist then); the tick loop below guards for that.
-        local nameLabel, statusLabel, volLabel, playPauseBtn, vizRowLabels, currentVizRows
-        local vizX, vizY
+        local nameLabel, statusLabel, volLabel, playPauseBtn, vizRowLabels, currentVizRows, currentVizCols
+        local vizX, vizY, statusY
+
+        -- Called once per drawNowPlaying(), right after currentVizRows/
+        -- currentVizCols are set for whichever mode is being built, so the
+        -- equalizer starts with a sensible fresh spread immediately on a
+        -- mode switch instead of looking flat/empty (all old heights from
+        -- the previous, usually much shorter, mode) until the random-walk
+        -- tick loop below gradually grows them back up over several
+        -- seconds.
+        local function resetVizHeights(cols, rows)
+            for c = 1, cols do
+                vizHeights[c] = math.random(0, rows)
+            end
+        end
 
         local function centerLabel(label, y, text, color)
             label:setText(text)
@@ -275,40 +296,49 @@ function M.run(mon, speakers, config, frame)
                 :setForeground(colors.lime)
                 :setBackground(colors.gray)
 
-            -- name/status sit at the same fixed spot in both modes -- only
-            -- the visualizer size and whether buttons exist differ.
-            local nameY, statusY = 3, 5
-            nameLabel = f:addLabel():setForeground(colors.white):setBackground(colors.black)
-            centerLabel(nameLabel, nameY, song.name:sub(1, w - 2))
-            statusLabel = f:addLabel():setForeground(colors.white):setBackground(colors.black)
-            centerLabel(statusLabel, statusY, "Loading...")
+            local nameY
 
             if state.controlsVisible then
                 -- Whole content block (song name, status, volume,
                 -- visualizer, controls) centered as one unit in the space
                 -- below the header and above the footer button, instead of
                 -- hugging the top-left with a lot of empty black space
-                -- below (the "very very empty" complaint). Real gaps
-                -- (2 rows) between name/status/volume, not stacked
-                -- directly on each other.
+                -- below it (restored -- fixing nameY/statusY to a constant
+                -- top position for both modes was a regression that left a
+                -- big dead gap between the buttons and the bottom of the
+                -- screen). Real gaps (2 rows) between name/status/volume,
+                -- not stacked directly on each other. COMPACT_VIZ_ROWS
+                -- scales with monitor height now (not a flat 5), so the
+                -- equalizer itself is bigger too, not just centered.
+                currentVizRows = COMPACT_VIZ_ROWS
+                currentVizCols = COMPACT_VIZ_COLS
+                resetVizHeights(currentVizCols, currentVizRows)
                 local buttonW = math.min(math.floor((w - 6) / 2), 16)
+                -- name(1) gap(2) status(1) gap(2) volume(1) gap(3) viz(currentVizRows) gap(2) 4 button rows w/ 1-row gaps(7)
+                local BLOCK_HEIGHT = 1 + 2 + 1 + 2 + 1 + 3 + currentVizRows + 2 + 7
+                local blockTop = math.max(3, math.floor((h - 1 - BLOCK_HEIGHT) / 2) + 1)
+                nameY = blockTop
+                statusY = nameY + 2
                 local volY = statusY + 2
                 vizY = volY + 3
-                currentVizRows = COMPACT_VIZ_ROWS
                 local btnRow1Y = vizY + currentVizRows + 2
                 local btnRow2Y = btnRow1Y + 2
                 local btnRow3Y = btnRow2Y + 2
                 local btnRow4Y = btnRow3Y + 2
-                vizX = math.max(1, math.floor((w - VIZ_COLS) / 2) + 1)
+                vizX = math.max(1, math.floor((w - currentVizCols) / 2) + 1)
                 local bx = math.max(1, math.floor((w - (buttonW * 2 + 2)) / 2) + 1)
 
+                nameLabel = f:addLabel():setForeground(colors.white):setBackground(colors.black)
+                centerLabel(nameLabel, nameY, song.name:sub(1, w - 2))
+                statusLabel = f:addLabel():setForeground(colors.white):setBackground(colors.black)
+                centerLabel(statusLabel, statusY, "Loading...")
                 volLabel = f:addLabel():setForeground(colors.lime):setBackground(colors.black)
 
                 vizRowLabels = {}
                 for r = 1, currentVizRows do
                     vizRowLabels[r] = f:addLabel()
-                        :setText((" "):rep(VIZ_COLS))
-                        :setSize(VIZ_COLS, 1)
+                        :setText((" "):rep(currentVizCols))
+                        :setSize(currentVizCols, 1)
                         :setPosition(vizX, vizY + r - 1)
                         :setForeground(VIZ_ROW_COLORS[r] or colors.green)
                         :setBackground(colors.black)
@@ -413,20 +443,29 @@ function M.run(mon, speakers, config, frame)
                     end)
             else
                 -- Immersive: no buttons, no volume line -- the equalizer
-                -- fills nearly the whole screen instead, with just a hint
-                -- at the bottom for how to get the controls back.
+                -- fills nearly the whole screen instead (wider AND taller
+                -- than compact mode, not just taller), with just a hint at
+                -- the bottom for how to get the controls back.
                 volLabel = nil
                 playPauseBtn = nil
+                nameY, statusY = 3, 5
+                nameLabel = f:addLabel():setForeground(colors.white):setBackground(colors.black)
+                centerLabel(nameLabel, nameY, song.name:sub(1, w - 2))
+                statusLabel = f:addLabel():setForeground(colors.white):setBackground(colors.black)
+                centerLabel(statusLabel, statusY, "Loading...")
+
                 vizY = statusY + 2
                 currentVizRows = math.max(COMPACT_VIZ_ROWS, h - vizY - 2)
-                vizX = math.max(1, math.floor((w - VIZ_COLS) / 2) + 1)
+                currentVizCols = IMMERSIVE_VIZ_COLS
+                resetVizHeights(currentVizCols, currentVizRows)
+                vizX = math.max(1, math.floor((w - currentVizCols) / 2) + 1)
 
                 vizRowLabels = {}
                 for r = 1, currentVizRows do
                     local colorIdx = math.min(r, #VIZ_ROW_COLORS)
                     vizRowLabels[r] = f:addLabel()
-                        :setText((" "):rep(VIZ_COLS))
-                        :setSize(VIZ_COLS, 1)
+                        :setText((" "):rep(currentVizCols))
+                        :setSize(currentVizCols, 1)
                         :setPosition(vizX, vizY + r - 1)
                         :setForeground(VIZ_ROW_COLORS[colorIdx])
                         :setBackground(colors.black)
@@ -469,7 +508,7 @@ function M.run(mon, speakers, config, frame)
         safeSchedule(function()
             local response, err = http.get(song.url, nil, true)
             if not response then
-                centerLabel(statusLabel, 5, "ERROR: " .. tostring(err))
+                centerLabel(statusLabel, statusY, "ERROR: " .. tostring(err))
                 sleep(1.5)
                 state.stopRequested = true
                 basalt.stop()
@@ -566,23 +605,31 @@ function M.run(mon, speakers, config, frame)
                     drawNowPlaying()
                 end
 
-                centerLabel(statusLabel, 5,
+                centerLabel(statusLabel, statusY,
                     (state.paused and "|| PAUSED  " or "> PLAYING  ") .. formatTime(state.elapsedMs / 1000))
                 if playPauseBtn then playPauseBtn:setText(state.paused and "Play" or "Pause") end
 
-                -- Roll new random bar heights (only while actually playing,
-                -- so it goes still on pause instead of animating uselessly)
-                -- and redraw all rows at once. currentVizRows/vizRowLabels
+                -- Step each column's bar height by a small bounded random
+                -- amount (a smoothed random walk) instead of re-rolling it
+                -- to a totally fresh random value every 0.3s tick -- a full
+                -- reroll each tick looked genuinely wonky/jarring
+                -- (confirmed) once immersive mode's much taller rows made
+                -- each column's swing far more visually dramatic than the
+                -- old flat 5-row version ever showed. Only while actually
+                -- playing, so it goes still on pause instead of animating
+                -- uselessly. currentVizRows/currentVizCols/vizRowLabels
                 -- always reflect whichever mode drawNowPlaying() last
                 -- built, compact or immersive.
                 if not state.paused then
-                    for c = 1, VIZ_COLS do
-                        vizHeights[c] = math.random(0, currentVizRows)
+                    local maxStep = math.max(1, math.floor(currentVizRows * 0.2))
+                    for c = 1, currentVizCols do
+                        local h2 = (vizHeights[c] or 0) + math.random(-maxStep, maxStep)
+                        vizHeights[c] = math.max(0, math.min(currentVizRows, h2))
                     end
                 end
                 for r = 1, currentVizRows do
                     local chars = {}
-                    for c = 1, VIZ_COLS do
+                    for c = 1, currentVizCols do
                         -- row 1 is the TOP of the bar, so a column needs
                         -- height >= (currentVizRows - r + 1) to reach this row.
                         chars[c] = (vizHeights[c] >= (currentVizRows - r + 1)) and "#" or " "
