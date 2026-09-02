@@ -240,6 +240,25 @@ local function runMainMenu(frame)
             basalt.stop()
         end)
 
+    -- Small "Quit" button, top-right corner, separate from the two main
+    -- buttons -- fully exits hub.lua back to the shell prompt (not just
+    -- back to this menu), for when you need to get to a prompt to edit or
+    -- delete files without having to open the Computer's own terminal and
+    -- find it to press Ctrl+T (which only works if that terminal has
+    -- keyboard focus in the first place -- this works by touching the
+    -- monitor itself).
+    local QUIT_W = 6
+    frame:addButton()
+        :setText("Quit")
+        :setPosition(w - QUIT_W + 1, 1)
+        :setSize(QUIT_W, 1)
+        :setBackground(colors.red)
+        :setForeground(colors.white)
+        :onClick(function()
+            chosen = "quit"
+            basalt.stop()
+        end)
+
     -- Force the very first real render now, before the matrix starts
     -- ticking below -- basalt.schedule() runs its function immediately
     -- (up to its first yield), so without this the matrix's first step
@@ -249,9 +268,11 @@ local function runMainMenu(frame)
 
     -- The whole box (border + interior) needs to be off-limits to the
     -- rain, not just the individual text cells -- see the note above on
-    -- why the interior doesn't need its own separate fill.
+    -- why the interior doesn't need its own separate fill. Same for the
+    -- Quit button's rectangle.
     matrix:setExclusions({
         { boxX, boxY, boxX + boxW - 1, boxY + boxH - 1 },
+        { w - QUIT_W + 1, 1, w, 1 },
     })
 
     -- Background matrix rain, redrawn continuously behind the frame's
