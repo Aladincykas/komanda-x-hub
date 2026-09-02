@@ -195,13 +195,15 @@ function M.decode(file, handlers)
             else
                 chunk = dfpwm.decode(data)
             end
-            -- Fire-and-forget, exactly like the reference player: no
-            -- waiting on speaker_audio_empty, no retry. The reference
-            -- design relies entirely on the video frame pacing above (which
-            -- runs interleaved with these audio records in file order) to
-            -- keep dispatch roughly real-time-paced. Waiting/retrying here
-            -- is what turned into the freeze -- one slow-to-drain speaker
-            -- among many networked ones stalling the whole shared timeline.
+            -- This decoder itself never waits on anything here -- it just
+            -- hands the decoded chunk to the handler and moves straight on
+            -- to the next record, so decode throughput is never gated by
+            -- speaker state. What the handler DOES with the chunk (dispatch
+            -- immediately, queue it, wait for acks, ...) is entirely up to
+            -- the caller -- see videoplayer.lua's onAudioChunk for why it
+            -- queues rather than dispatching inline (a genuine
+            -- fire-and-forget dispatch broke multi-speaker sync badly when
+            -- tried, confirmed in-game).
             if handlers.onAudioChunk then handlers.onAudioChunk(chunk) end
         elseif ftype == 8 then
             -- Subtitle record: nothing in this project's UI renders

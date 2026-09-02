@@ -105,6 +105,53 @@ function M.run(mon, speakers, config, frame)
     local w, h = mon.getSize()
     local manifestUrls = buildManifestUrls(config)
 
+    -- Declared here (not down by the library loop) so playSong()'s closure
+    -- below can set it directly -- an idle timeout firing WHILE a song is
+    -- playing needs to force all the way out to the main menu, not just
+    -- back to the library screen.
+    local exitReason = nil
+
+    -- Idle watcher: reusable, but scheduled FRESH inside whichever
+    -- basalt.run() session is actually pumping events (once at the top of
+    -- the library loop, once at the top of playSong), rather than trying to
+    -- keep ONE watcher coroutine alive across two separate basalt.run()
+    -- calls. A single coroutine scheduled once used to sit suspended
+    -- between the library's run() and playSong's own run() -- Basalt's
+    -- `schedules` table is never cleared between run() calls so it wasn't
+    -- literally dead, but it only gets resumed (and can only make forward
+    -- progress) while SOME run() loop is actively dispatching events, and a
+    -- long-idle Now Playing screen with nothing else scheduling frequent
+    -- events made that unreliable in practice (confirmed in-game: idle
+    -- timeout wasn't firing while a song was left playing). Rescheduling
+    -- fresh inside the run() that's actually live removes that ambiguity
+    -- entirely. `lastActivityMs` is a shared upvalue so activity carries
+    -- over between the library and Now Playing without resetting the clock
+    -- just because the screen changed.
+    local lastActivityMs = os.epoch("utc")
+    local function startIdleWatcher(onIdle)
+        safeSchedule(function()
+            local timeoutMs = (config.MUSIC_MENU_IDLE_TIMEOUT_SEC or 300) * 1000
+            while true do
+                local timerId = os.startTimer(5)
+                repeat
+                    local event, p1 = os.pullEventRaw()
+                    if event == "terminate" then
+                        _G.KOMANDA_TERMINATED = true
+                        for _, spk in ipairs(speakers) do pcall(spk.stop) end
+                        basalt.stop()
+                        return
+                    elseif event == "monitor_touch" or event == "key" or event == "char" or event == "mouse_click" then
+                        lastActivityMs = os.epoch("utc")
+                    end
+                until event == "timer" and p1 == timerId
+                if os.epoch("utc") - lastActivityMs > timeoutMs then
+                    onIdle()
+                    return
+                end
+            end
+        end)
+    end
+
     -- ==== Now Playing screen ====
     -- 5-row bar equalizer, old-media-player style: each of the VIZ_COLS
     -- columns has its own random height 0-5, one addLabel per ROW (not per
@@ -359,6 +406,14 @@ function M.run(mon, speakers, config, frame)
             end
         end)
 
+        startIdleWatcher(function()
+            exitReason = exitReason or "idle"
+            state.stopRequested = true
+            os.queueEvent("music_control")
+            for _, spk in ipairs(speakers) do pcall(spk.stop) end
+            basalt.stop()
+        end)
+
         basalt.run()
     end
 
@@ -368,7 +423,6 @@ function M.run(mon, speakers, config, frame)
     local footerRow = h
     local perPage = math.max(1, math.floor((footerRow - contentTop) / ROW_STEP))
 
-    local exitReason = nil
     local songs, loadErrors = fetchSongs(manifestUrls)
     local page = 1
     local selectedSong = nil -- set by a song button's onClick, read by the loop below AFTER run() returns
@@ -482,53 +536,22 @@ function M.run(mon, speakers, config, frame)
             end)
     end
 
-    -- Idle timeout, same os.pullEvent-polling pattern as the video menu
-    -- (see hub.lua's note on why basalt.onEvent isn't used here). Started
-    -- ONCE for the whole session below, not per-loop-pass -- CC broadcasts
-    -- events to every coroutine waiting on pullEvent regardless of which
-    -- frame/run() is currently active, so this correctly tracks activity
-    -- across both the library and the now-playing screen without needing
-    -- to be restarted, and without leaking a new one per song played.
-    -- If idle fires mid-playback it also force-stops the speakers directly
-    -- (rather than relying on the playback coroutine to notice) since
-    -- stopping THAT frame's run() loop doesn't by itself stop audio
-    -- already queued on the speakers.
-    -- pullEventRaw here (not plain pullEvent, which throws on terminate) --
-    -- same reasoning as the matching idle-timeout loop in hub.lua's
-    -- runVideoMenu.
-    safeSchedule(function()
-        local lastActivity = os.epoch("utc")
-        local timeoutMs = (config.MUSIC_MENU_IDLE_TIMEOUT_SEC or 150) * 1000
-        while true do
-            local timerId = os.startTimer(5)
-            repeat
-                local event, p1 = os.pullEventRaw()
-                if event == "terminate" then
-                    _G.KOMANDA_TERMINATED = true
-                    for _, spk in ipairs(speakers) do pcall(spk.stop) end
-                    basalt.stop()
-                    return
-                elseif event == "monitor_touch" or event == "key" or event == "char" or event == "mouse_click" then
-                    lastActivity = os.epoch("utc")
-                end
-            until event == "timer" and p1 == timerId
-            if os.epoch("utc") - lastActivity > timeoutMs then
-                exitReason = exitReason or "idle"
-                for _, spk in ipairs(speakers) do pcall(spk.stop) end
-                basalt.stop()
-                return
-            end
-        end
-    end)
-
     -- Same reuse-the-frame pattern as hub.lua's runVideoMenu: rebuild and
     -- run the library screen; if a song was picked, play it (its own,
     -- separate basalt.run() call, only reached once THIS run() has fully
-    -- returned) then loop back around to the library, fresh.
+    -- returned) then loop back around to the library, fresh. The idle
+    -- watcher is (re)scheduled fresh each pass -- see startIdleWatcher's
+    -- comment up top for why -- and shares lastActivityMs with playSong's
+    -- own watcher so activity carries over across screen switches.
     while not exitReason and not _G.KOMANDA_TERMINATED do
         selectedSong = nil
         drawLibrary()
         frame:draw()
+        startIdleWatcher(function()
+            exitReason = exitReason or "idle"
+            for _, spk in ipairs(speakers) do pcall(spk.stop) end
+            basalt.stop()
+        end)
         basalt.run()
 
         if selectedSong and not _G.KOMANDA_TERMINATED then

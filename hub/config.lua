@@ -43,8 +43,8 @@ return {
     MENU_MUSIC_NAME = nil, -- set to a song name from MUSIC_LIBRARIES once you have a track picked
 
     -- Idle timeouts, in seconds
-    VIDEO_MENU_IDLE_TIMEOUT_SEC = 150,   -- video list -> main menu
-    MUSIC_MENU_IDLE_TIMEOUT_SEC = 150,   -- music list -> main menu
+    VIDEO_MENU_IDLE_TIMEOUT_SEC = 300,   -- video list -> main menu
+    MUSIC_MENU_IDLE_TIMEOUT_SEC = 300,   -- music library OR now-playing (idle mid-song forces all the way to main menu) -> main menu
 
     DEFAULT_VOLUME = 1.0,
     MAX_VOLUME = 3.0, -- CC:Tweaked speaker.playAudio volume ceiling

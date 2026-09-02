@@ -169,9 +169,26 @@ local function drawFrame(mon, image, lastPalette, lastRows)
     end
 end
 
+-- CC:Tweaked's real default 16-color palette (from Colour.java). This used
+-- to call a `mon.nativePaletteColor` method that -- confirmed by checking
+-- the actual CC:Tweaked monitor API -- doesn't exist at all. Since it was
+-- referenced as `mon.nativePaletteColor and mon.nativePaletteColor(...) or
+-- 0`, that's not an error (no attempt is ever made to CALL a nil value) --
+-- it just silently evaluated to 0 for every channel, meaning every "reset"
+-- actually set all 16 palette slots to pure black with no error thrown.
+-- That corrupted every screen drawn afterward (video menu, main menu, all
+-- of it) until the monitor block itself was broken and replaced -- this is
+-- very likely the real cause of the "monitor goes black/corrupts, survives
+-- reboot" reports throughout this project, not an fps/memory issue at all.
+local DEFAULT_PALETTE_RGB = {
+    [0] = 0xF0F0F0, 0xF2B233, 0xE57FD8, 0x99B2F2,
+    0xDEDE6C, 0x7FCC19, 0xF2B2CC, 0x4C4C4C,
+    0x999999, 0x4C99B2, 0xB266E5, 0x3366CC,
+    0x7F664C, 0x57A64E, 0xCC4C4C, 0x111111,
+}
 local function resetPalette(mon)
     for i = 0, 15 do
-        mon.setPaletteColor(2 ^ i, mon.nativePaletteColor and mon.nativePaletteColor(2 ^ i) or 0)
+        mon.setPaletteColor(2 ^ i, DEFAULT_PALETTE_RGB[i])
     end
 end
 
@@ -255,10 +272,22 @@ function M.play(mon, speakers, entry, config)
                 end
             end,
             onAudioChunk = function(chunk)
+                -- Hand the chunk off via a queued event instead of playing
+                -- it here directly -- decode/video pacing must never block
+                -- on a speaker. A previous version called speaker.playAudio
+                -- straight from here with no wait ("fire-and-forget", like
+                -- sanjuuni's own reference player) and confirmed in-game
+                -- that broke multi-speaker sync badly ("not every speaker
+                -- sound the same and gets delayed... completely shatted
+                -- system with speakers") -- the reference player is written
+                -- for ONE local speaker, not dozens of networked ones, so
+                -- its no-wait/no-retry assumption doesn't hold here. The
+                -- separate audio-dispatcher branch below restores the
+                -- known-good synchronized per-speaker ack+timeout dispatch,
+                -- decoupled from this decode/video loop via os.queueEvent
+                -- so a slow speaker still can't stall video pacing either.
                 if state.stopRequested then return end
-                for _, speaker in ipairs(speakers) do
-                    speaker.playAudio(chunk, state.volume)
-                end
+                os.queueEvent("kx_audio_chunk", chunk)
             end,
         }
 
@@ -267,6 +296,36 @@ function M.play(mon, speakers, entry, config)
                 function()
                     decodeModule.decode(file, handlers)
                     cumulativeSec = cumulativeSec + framesPlayed / fps
+                end,
+                function() -- audio dispatcher: consumes queued chunks, fans each out
+                    -- to every networked speaker in sync (waits for each speaker's own
+                    -- speaker_audio_empty ack, with a 3s per-speaker timeout so one dead
+                    -- speaker among many can't stall the others indefinitely).
+                    while not state.stopRequested do
+                        local _, chunk = os.pullEvent("kx_audio_chunk")
+                        if chunk and not state.stopRequested and #speakers > 0 then
+                            local funcs = {}
+                            for _, speaker in ipairs(speakers) do
+                                funcs[#funcs + 1] = function()
+                                    while not state.stopRequested and not speaker.playAudio(chunk, state.volume) do
+                                        local timerId = os.startTimer(3)
+                                        local gaveUp = false
+                                        repeat
+                                            local ev2, a = os.pullEvent()
+                                            if ev2 == "speaker_audio_empty" and a == peripheral.getName(speaker) then
+                                                break
+                                            elseif ev2 == "timer" and a == timerId then
+                                                gaveUp = true
+                                                break
+                                            end
+                                        until state.stopRequested
+                                        if gaveUp or state.stopRequested then break end
+                                    end
+                                end
+                            end
+                            parallel.waitForAll(table.unpack(funcs))
+                        end
+                    end
                 end,
                 function() -- input handling: keyboard (at the Computer) and touch (at the monitor)
                     while not state.stopRequested do
