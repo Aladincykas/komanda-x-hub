@@ -111,6 +111,14 @@ function M.run(mon, speakers, config, frame)
     -- back to the library screen.
     local exitReason = nil
 
+    -- The playlist: an in-memory array of song tables (same shape as
+    -- entries from songs.json), built up by tapping songs on the "Add to
+    -- Playlist" screen. Lives for the whole M.run() session (persists
+    -- across screen switches, cleared only if the whole music player is
+    -- re-entered from the main menu) -- there's no persistence to disk,
+    -- same as the rest of this session's transient UI state.
+    local playlist = {}
+
     -- Idle watcher: reusable, but scheduled FRESH inside whichever
     -- basalt.run() session is actually pumping events (once at the top of
     -- the library loop, once at the top of playSong), rather than trying to
@@ -166,7 +174,15 @@ function M.run(mon, speakers, config, frame)
     local vizHeights = {}
     for i = 1, VIZ_COLS do vizHeights[i] = 0 end
 
-    local function playSong(song)
+    -- backLabel: text for the footer button that returns without finishing
+    -- the song (defaults to "Back to Library"; playlist playback passes
+    -- "Back to Playlist" instead so the label matches where it actually
+    -- goes back to). Returns "finished" if the song played to the end on
+    -- its own, or "stopped" if the user hit Stop/the back button -- the
+    -- playlist-playback loop below uses this to decide whether to
+    -- auto-advance to the next track or stop the whole playlist.
+    local function playSong(song, backLabel)
+        backLabel = backLabel or "Back to Library"
         clearFrameChildren(frame)
         local f = frame
 
@@ -251,6 +267,7 @@ function M.run(mon, speakers, config, frame)
             lastTickMs = os.epoch("utc"),
             volume = savedSettings.musicVolume or config.DEFAULT_VOLUME,
         }
+        local playReason = "finished" -- overwritten to "stopped" by Stop/back below
 
         local function updateVolLabel()
             local pct = math.floor(state.volume / config.MAX_VOLUME * 100 + 0.5)
@@ -288,6 +305,7 @@ function M.run(mon, speakers, config, frame)
             :setBackground(colors.red)
             :setForeground(colors.white)
             :onClick(function()
+                playReason = "stopped"
                 state.stopRequested = true
                 os.queueEvent("music_control")
             end)
@@ -341,12 +359,13 @@ function M.run(mon, speakers, config, frame)
             :onClick(function() adjustVolume(0.20) end)
 
         f:addButton()
-            :setText("Back to Library")
+            :setText(backLabel)
             :setPosition(2, h)
             :setSize(math.min(w - 2, 20), 1)
             :setBackground(colors.gray)
             :setForeground(colors.lime)
             :onClick(function()
+                playReason = "stopped"
                 state.stopRequested = true
                 os.queueEvent("music_control")
             end)
@@ -459,6 +478,7 @@ function M.run(mon, speakers, config, frame)
 
         startIdleWatcher(function()
             exitReason = exitReason or "idle"
+            playReason = "stopped"
             state.stopRequested = true
             os.queueEvent("music_control")
             for _, spk in ipairs(speakers) do pcall(spk.stop) end
@@ -466,6 +486,7 @@ function M.run(mon, speakers, config, frame)
         end)
 
         basalt.run()
+        return playReason
     end
 
     -- ==== Library list (paginated, tappable rows) ====
@@ -477,6 +498,11 @@ function M.run(mon, speakers, config, frame)
     local songs, loadErrors = fetchSongs(manifestUrls)
     local page = 1
     local selectedSong = nil -- set by a song button's onClick, read by the loop below AFTER run() returns
+    -- Which screen the state machine loop at the bottom shows next --
+    -- "library" (default), "playlist", or "addSongs". Set by a footer
+    -- button's onClick alongside basalt.stop(), same pattern as
+    -- selectedSong.
+    local nextScreen = nil
 
     local function drawLibrary()
         clearFrameChildren(frame)
@@ -540,7 +566,7 @@ function M.run(mon, speakers, config, frame)
             end
         end
 
-        local navW = math.min(math.floor((w - 8) / 3), 14)
+        local navW = math.min(math.floor((w - 10) / 4), 12)
         f:addButton()
             :setText("< Prev")
             :setPosition(2, footerRow)
@@ -576,6 +602,17 @@ function M.run(mon, speakers, config, frame)
             end)
 
         f:addButton()
+            :setText("Playlist")
+            :setPosition(8 + navW * 3, footerRow)
+            :setSize(navW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function()
+                nextScreen = "playlist"
+                basalt.stop()
+            end)
+
+        f:addButton()
             :setText("Main Menu")
             :setPosition(w - math.min(w - 2, 14) + 1, footerRow)
             :setSize(math.min(w - 2, 14), 1)
@@ -587,26 +624,262 @@ function M.run(mon, speakers, config, frame)
             end)
     end
 
+    -- ==== Playlist screen (paginated, per-row Remove) ====
+    -- Its own perPage, one ROW_STEP smaller than the library's -- this
+    -- screen has an EXTRA footer row (Play All / Back, above the
+    -- Prev/Next/+Add row) that the library screen doesn't, so reusing the
+    -- library's perPage would let the last content row overlap it.
+    local playlistPerPage = math.max(1, math.floor((footerRow - ROW_STEP - contentTop) / ROW_STEP))
+    local playlistPage = 1
+    local playlistAction = nil -- set by a footer button: "play" | "add" | "back"
+
+    local function drawPlaylist()
+        clearFrameChildren(frame)
+        local f = frame
+        local totalPages = math.max(1, math.ceil(#playlist / playlistPerPage))
+        if playlistPage > totalPages then playlistPage = totalPages end
+
+        f:addLabel()
+            :setText((" PLAYLIST "):sub(1, w))
+            :setSize(w, 1)
+            :setPosition(1, 1)
+            :setForeground(colors.lime)
+            :setBackground(colors.gray)
+
+        f:addLabel()
+            :setText(#playlist == 0 and "Empty -- tap + Add Songs below."
+                or ("%d song(s) -- page %d/%d"):format(#playlist, playlistPage, totalPages))
+            :setPosition(2, 2)
+            :setForeground(colors.lightGray)
+            :setBackground(colors.black)
+
+        -- Each row: the song name (tap does nothing, it's just a label)
+        -- plus a small red "X" remove button at the right edge of the row.
+        local removeW = 3
+        local startIdx = (playlistPage - 1) * playlistPerPage + 1
+        for i = 0, playlistPerPage - 1 do
+            local idx = startIdx + i
+            local song = playlist[idx]
+            if song then
+                local rowY = contentTop + i * ROW_STEP
+                f:addLabel()
+                    :setText(song.name:sub(1, w - removeW - 3))
+                    :setPosition(2, rowY)
+                    :setSize(w - removeW - 2, 1)
+                    :setForeground(colors.white)
+                    :setBackground(colors.black)
+                f:addButton()
+                    :setText("X")
+                    :setPosition(w - removeW, rowY)
+                    :setSize(removeW, 1)
+                    :setBackground(colors.red)
+                    :setForeground(colors.white)
+                    :onClick(function()
+                        table.remove(playlist, idx)
+                        drawPlaylist()
+                    end)
+            end
+        end
+
+        local navW = math.min(math.floor((w - 8) / 3), 14)
+        f:addButton()
+            :setText("< Prev")
+            :setPosition(2, footerRow)
+            :setSize(navW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function()
+                if playlistPage > 1 then playlistPage = playlistPage - 1 end
+                drawPlaylist()
+            end)
+
+        f:addButton()
+            :setText("Next >")
+            :setPosition(4 + navW, footerRow)
+            :setSize(navW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function()
+                if playlistPage < totalPages then playlistPage = playlistPage + 1 end
+                drawPlaylist()
+            end)
+
+        f:addButton()
+            :setText("+ Add Songs")
+            :setPosition(6 + navW * 2, footerRow)
+            :setSize(navW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function()
+                playlistAction = "add"
+                basalt.stop()
+            end)
+
+        local playW = math.min(w - 2, 16)
+        f:addButton()
+            :setText("Play All")
+            :setPosition(2, footerRow - ROW_STEP)
+            :setSize(playW, 1)
+            :setBackground(#playlist > 0 and colors.lime or colors.gray)
+            :setForeground(#playlist > 0 and colors.black or colors.lightGray)
+            :onClick(function()
+                if #playlist > 0 then
+                    playlistAction = "play"
+                    basalt.stop()
+                end
+            end)
+
+        f:addButton()
+            :setText("Back")
+            :setPosition(2 + playW + 2, footerRow - ROW_STEP)
+            :setSize(playW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function()
+                playlistAction = "back"
+                basalt.stop()
+            end)
+    end
+
+    -- ==== Add-to-Playlist screen: same song list, tap = add, not play ====
+    local addPage = 1
+
+    local function drawAddSongs()
+        clearFrameChildren(frame)
+        local f = frame
+        local totalPages = math.max(1, math.ceil(#songs / perPage))
+        if addPage > totalPages then addPage = totalPages end
+
+        f:addLabel()
+            :setText((" ADD TO PLAYLIST "):sub(1, w))
+            :setSize(w, 1)
+            :setPosition(1, 1)
+            :setForeground(colors.lime)
+            :setBackground(colors.gray)
+
+        f:addLabel()
+            :setText(("Tap a song to add it -- Playlist: %d song(s)"):format(#playlist))
+            :setPosition(2, 2)
+            :setForeground(colors.lightGray)
+            :setBackground(colors.black)
+
+        if #songs == 0 then
+            f:addLabel()
+                :setText("No songs found.")
+                :setPosition(2, contentTop)
+                :setForeground(colors.lightGray)
+                :setBackground(colors.black)
+        else
+            local startIdx = (addPage - 1) * perPage + 1
+            for i = 0, perPage - 1 do
+                local idx = startIdx + i
+                local song = songs[idx]
+                if song then
+                    f:addButton()
+                        :setText(song.name:sub(1, w - 4))
+                        :setPosition(2, contentTop + i * ROW_STEP)
+                        :setSize(w - 2, 1)
+                        :setBackground(colors.gray)
+                        :setForeground(colors.lime)
+                        :onClick(function()
+                            table.insert(playlist, song)
+                            drawAddSongs() -- redraw in place -- the counter above updates, stays on this screen
+                        end)
+                end
+            end
+        end
+
+        local navW = math.min(math.floor((w - 8) / 3), 14)
+        f:addButton()
+            :setText("< Prev")
+            :setPosition(2, footerRow)
+            :setSize(navW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function()
+                if addPage > 1 then addPage = addPage - 1 end
+                drawAddSongs()
+            end)
+
+        f:addButton()
+            :setText("Next >")
+            :setPosition(4 + navW, footerRow)
+            :setSize(navW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function()
+                if addPage < totalPages then addPage = addPage + 1 end
+                drawAddSongs()
+            end)
+
+        f:addButton()
+            :setText("Done")
+            :setPosition(6 + navW * 2, footerRow)
+            :setSize(navW, 1)
+            :setBackground(colors.gray)
+            :setForeground(colors.lime)
+            :onClick(function()
+                basalt.stop()
+            end)
+    end
+
     -- Same reuse-the-frame pattern as hub.lua's runVideoMenu: rebuild and
-    -- run the library screen; if a song was picked, play it (its own,
-    -- separate basalt.run() call, only reached once THIS run() has fully
-    -- returned) then loop back around to the library, fresh. The idle
-    -- watcher is (re)scheduled fresh each pass -- see startIdleWatcher's
-    -- comment up top for why -- and shares lastActivityMs with playSong's
-    -- own watcher so activity carries over across screen switches.
+    -- run whichever screen is current, act on what its buttons set, then
+    -- loop back around fresh. The idle watcher is (re)scheduled fresh each
+    -- pass on every screen -- see startIdleWatcher's comment up top for why
+    -- -- and shares lastActivityMs across all of them so activity carries
+    -- over no matter which screen is showing.
+    local screen = "library" -- "library" | "playlist" | "addSongs"
     while not exitReason and not _G.KOMANDA_TERMINATED do
-        selectedSong = nil
-        drawLibrary()
-        frame:draw()
-        startIdleWatcher(function()
+        local idleStop = function()
             exitReason = exitReason or "idle"
             for _, spk in ipairs(speakers) do pcall(spk.stop) end
             basalt.stop()
-        end)
-        basalt.run()
+        end
 
-        if selectedSong and not _G.KOMANDA_TERMINATED then
-            playSong(selectedSong)
+        if screen == "library" then
+            selectedSong = nil
+            nextScreen = nil
+            drawLibrary()
+            frame:draw()
+            startIdleWatcher(idleStop)
+            basalt.run()
+
+            if nextScreen then
+                screen = nextScreen
+            elseif selectedSong and not _G.KOMANDA_TERMINATED then
+                playSong(selectedSong)
+            end
+        elseif screen == "playlist" then
+            playlistAction = nil
+            drawPlaylist()
+            frame:draw()
+            startIdleWatcher(idleStop)
+            basalt.run()
+
+            if playlistAction == "add" then
+                screen = "addSongs"
+            elseif playlistAction == "back" then
+                screen = "library"
+            elseif playlistAction == "play" and #playlist > 0 and not _G.KOMANDA_TERMINATED then
+                local i = 1
+                while i <= #playlist and not exitReason and not _G.KOMANDA_TERMINATED do
+                    local reason = playSong(playlist[i], "Back to Playlist")
+                    if reason ~= "finished" then break end
+                    i = i + 1
+                end
+                -- Whether it played through to the end, got stopped, or
+                -- one song errored out, land back on the playlist screen
+                -- (not the library) -- exitReason (idle/quit/menu) still
+                -- overrides this via the outer while condition above.
+                screen = "playlist"
+            end
+        elseif screen == "addSongs" then
+            drawAddSongs()
+            frame:draw()
+            startIdleWatcher(idleStop)
+            basalt.run()
+            screen = "playlist" -- Done always returns to the playlist view
         end
     end
 
