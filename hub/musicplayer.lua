@@ -237,7 +237,18 @@ function M.run(mon, speakers, config, frame)
         local state = {
             paused = false,
             stopRequested = false,
-            elapsedBytes = 0,
+            -- Real wall-clock elapsed time (like the video player's
+            -- os.epoch-paced clock), NOT inferred from DFPWM byte count.
+            -- The old version divided bytes-read-so-far by 6000 (the
+            -- DFPWM-at-48kHz byte rate) -- mathematically reasonable, but
+            -- it counted bytes as soon as they were DOWNLOADED, not as
+            -- they were actually PLAYED, so it could run ahead of (or
+            -- behind) what was actually audible rather than tracking real
+            -- time. elapsedMs only advances while actually playing
+            -- (paused time doesn't count), accumulated in small real
+            -- deltas by the status-label tick below.
+            elapsedMs = 0,
+            lastTickMs = os.epoch("utc"),
             volume = savedSettings.musicVolume or config.DEFAULT_VOLUME,
         }
 
@@ -362,7 +373,6 @@ function M.run(mon, speakers, config, frame)
 
                 local chunk = response.read(chunkSize)
                 if not chunk then break end
-                state.elapsedBytes = state.elapsedBytes + #chunk
 
                 -- Dispatch to every speaker IN PARALLEL, not one at a time.
                 -- The old version looped speakers sequentially, each
@@ -410,8 +420,19 @@ function M.run(mon, speakers, config, frame)
 
         safeSchedule(function()
             while true do
+                -- Real wall-clock elapsed time -- only advances while
+                -- actually playing (a real delta each tick, so pausing
+                -- genuinely freezes it instead of it drifting from
+                -- inferred data rates). See the state table's comment
+                -- above for why this replaced byte-count-based timing.
+                local nowMs = os.epoch("utc")
+                if not state.paused then
+                    state.elapsedMs = state.elapsedMs + (nowMs - state.lastTickMs)
+                end
+                state.lastTickMs = nowMs
+
                 centerLabel(statusLabel, statusY,
-                    (state.paused and "|| PAUSED  " or "> PLAYING  ") .. formatTime(state.elapsedBytes / 6000))
+                    (state.paused and "|| PAUSED  " or "> PLAYING  ") .. formatTime(state.elapsedMs / 1000))
                 playPauseBtn:setText(state.paused and "Play" or "Pause")
 
                 -- Roll new random bar heights (only while actually playing,
