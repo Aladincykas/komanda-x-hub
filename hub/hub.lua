@@ -311,10 +311,32 @@ local function runMainMenu(frame)
 
     -- Background matrix rain, redrawn continuously behind the frame's
     -- widgets while Basalt's own event loop is running.
+    --
+    -- NOT using plain sleep(0.2) to pace this -- sleep() internally waits
+    -- for ONE SPECIFIC timer event (its own os.startTimer id) and nothing
+    -- else, so this coroutine could only ever re-check "while not chosen"
+    -- once THAT specific timer fires, not immediately when a menu button
+    -- is actually tapped (a monitor_touch/mouse_click event, which sleep()
+    -- ignores entirely while waiting). In practice that's at most one
+    -- ~0.2s step's worth of delay, not the real cause of the matrix
+    -- corruption seen bleeding through onto other screens by itself -- but
+    -- it IS a real gap between "the user picked a screen" and "this
+    -- coroutine actually notices and stops running", and closing it
+    -- entirely is worth doing regardless: pull raw events directly and
+    -- check `chosen` after EVERY one, of any kind, so this loop exits on
+    -- the very next event after a selection is made, not only once its
+    -- own pacing timer happens to fire.
     safeSchedule(function()
         while not chosen do
             matrix:step(0.2)
-            sleep(0.2)
+            local timerId = os.startTimer(0.2)
+            repeat
+                local event, p1 = os.pullEventRaw()
+                if event == "terminate" then
+                    _G.KOMANDA_TERMINATED = true
+                    return
+                end
+            until chosen or (event == "timer" and p1 == timerId)
         end
     end)
 
@@ -331,7 +353,23 @@ local function runMainMenu(frame)
                 if s.name == config.MENU_MUSIC_NAME then track = s break end
             end
             if not track then
-                sleep(5)
+                -- Same reasoning as the matrix loop above: plain sleep()
+                -- only wakes on its own specific timer, not on a
+                -- selection being made -- check chosen on every event
+                -- instead so this doesn't linger for up to 5s after a
+                -- menu button's already been tapped. (Not the active
+                -- cause of anything reported so far -- config.MENU_MUSIC_NAME
+                -- is unset, so this whole coroutine returns immediately
+                -- without ever reaching this branch right now -- fixed for
+                -- correctness/consistency regardless.)
+                local timerId = os.startTimer(5)
+                repeat
+                    local event, p1 = os.pullEventRaw()
+                    if event == "terminate" then
+                        _G.KOMANDA_TERMINATED = true
+                        return
+                    end
+                until chosen or (event == "timer" and p1 == timerId)
             else
                 local response = http.get(track.url, nil, true)
                 if response then
