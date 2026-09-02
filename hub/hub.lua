@@ -391,6 +391,9 @@ local function runVideoMenu(frame)
     while not exitReason and not _G.KOMANDA_TERMINATED do
         local videos = fetchMergedManifest(videoManifestUrls(), "videos.json")
         local selectedVideo = nil
+        -- Set true the instant a video is tapped, BEFORE basalt.stop() --
+        -- see the idle-watcher below for why this matters.
+        local videoSelected = false
         local perPage = math.max(1, math.floor((footerRow - contentTop) / ROW_STEP))
         local totalPages = math.max(1, math.ceil(#videos / perPage))
 
@@ -431,6 +434,7 @@ local function runVideoMenu(frame)
                             :setForeground(colors.lime)
                             :onClick(function()
                                 selectedVideo = video
+                                videoSelected = true
                                 basalt.stop()
                             end)
                     end
@@ -491,10 +495,45 @@ local function runVideoMenu(frame)
         -- silently eaten depending on scheduling order. Checking for
         -- "terminate" explicitly here too means this doesn't depend on
         -- that ordering at all.
+        -- IMPORTANT: this coroutine MUST notice this iteration is over and
+        -- exit cleanly, or it leaks. Basalt's `schedules` table only ever
+        -- gets a dead coroutine removed by naturally resuming it again --
+        -- but videoplayer.play() drives its OWN raw event loop
+        -- (parallel.waitForAny, not Basalt's run()), so while a video
+        -- plays, NOTHING calls Basalt's dispatch()/resumeSchedules() at
+        -- all, and this coroutine simply never gets resumed again during
+        -- that whole time. Worse: the os.startTimer(5) it's waiting on
+        -- still fires for real (CC's timers aren't tied to which
+        -- coroutine is "listening") and gets drained by videoplayer's OWN
+        -- event pump instead (which doesn't recognize it and just
+        -- discards it) -- so by the time we're back here and this
+        -- coroutine finally gets resumed again, the ONE timer event it
+        -- was ever going to match is already gone forever, and it's stuck
+        -- waiting on a timerId that will never come again. That's a
+        -- genuine permanent leak: one dead-but-never-cleaned-up coroutine
+        -- per video watched, each adding a little overhead to literally
+        -- every future event this whole program ever processes again --
+        -- confirmed as a very plausible cause of things slowly bogging
+        -- down/going unresponsive "after a while" of normal use (watching
+        -- several videos over a session), not from any single symptom but
+        -- from this accumulating in the background the whole time.
+        --
+        -- Not just videoSelected -- exitReason also needs checking, since
+        -- "Back to Menu" (or this SAME watcher's own idle-timeout) ends
+        -- this loop iteration WITHOUT ever setting videoSelected, and once
+        -- that happens this specific screen's videoSelected upvalue can
+        -- never become true again -- leaving this coroutine looping its
+        -- own idle-check forever on whatever screen the user goes to
+        -- next, needlessly. Both are flipped BEFORE basalt.stop() in their
+        -- respective onClick handlers, so this coroutine still gets
+        -- resumed one more time with that very same event (Basalt finishes
+        -- fanning the current event out to every schedule before its
+        -- run() loop re-checks whether to keep going) -- letting it see
+        -- the flag and exit cleanly right then.
         safeSchedule(function()
             local lastActivity = os.epoch("utc")
             local timeoutMs = (config.VIDEO_MENU_IDLE_TIMEOUT_SEC or 150) * 1000
-            while true do
+            while not videoSelected and not exitReason do
                 local timerId = os.startTimer(5)
                 repeat
                     local event, p1 = os.pullEventRaw()
@@ -505,7 +544,8 @@ local function runVideoMenu(frame)
                     elseif event == "monitor_touch" or event == "key" or event == "char" or event == "mouse_click" then
                         lastActivity = os.epoch("utc")
                     end
-                until event == "timer" and p1 == timerId
+                until (event == "timer" and p1 == timerId) or videoSelected or exitReason
+                if videoSelected or exitReason then return end
                 if os.epoch("utc") - lastActivity > timeoutMs then
                     exitReason = exitReason or "idle"
                     basalt.stop()

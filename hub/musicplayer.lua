@@ -136,10 +136,35 @@ function M.run(mon, speakers, config, frame)
     -- over between the library and Now Playing without resetting the clock
     -- just because the screen changed.
     local lastActivityMs = os.epoch("utc")
+    -- Bumped every time startIdleWatcher() is called (once per screen
+    -- switch -- library, Now Playing, playlist, add-songs). Each watcher
+    -- captures its OWN generation number and checks whether a newer one
+    -- has since taken over on every event; without this, every screen
+    -- switch schedules another watcher without ever stopping the previous
+    -- one -- Basalt's shared `schedules` table keeps servicing all of them
+    -- fine (they don't deadlock/leak the way hub.lua's video-menu watcher
+    -- could -- see the matching note there), but over a long session with
+    -- many songs played, they'd pile up as pure redundant overhead,
+    -- literally identical work done over and over on every single future
+    -- event for the rest of the session. Capping it to effectively one
+    -- live watcher at a time avoids that slow accumulation.
+    -- Also checked below alongside the generation number -- covers the ONE
+    -- case the generation counter alone doesn't: the very LAST watcher
+    -- started (whichever screen the player exits M.run() from) never gets
+    -- superseded by a newer one, since M.run() just returns to hub.lua
+    -- instead of switching to another screen of its own. Without this, that
+    -- last watcher would keep running (and could eventually call
+    -- basalt.stop() on whatever UNRELATED screen -- main menu, video menu
+    -- -- happens to be active by the time its idle timeout elapses, since
+    -- Basalt's schedules table is shared across the whole hub, not scoped
+    -- to this one module).
+    local idleWatcherGen = 0
     local function startIdleWatcher(onIdle)
+        idleWatcherGen = idleWatcherGen + 1
+        local myGen = idleWatcherGen
         safeSchedule(function()
             local timeoutMs = (config.MUSIC_MENU_IDLE_TIMEOUT_SEC or 300) * 1000
-            while true do
+            while myGen == idleWatcherGen and not exitReason do
                 local timerId = os.startTimer(5)
                 repeat
                     local event, p1 = os.pullEventRaw()
@@ -151,7 +176,8 @@ function M.run(mon, speakers, config, frame)
                     elseif event == "monitor_touch" or event == "key" or event == "char" or event == "mouse_click" then
                         lastActivityMs = os.epoch("utc")
                     end
-                until event == "timer" and p1 == timerId
+                until (event == "timer" and p1 == timerId) or myGen ~= idleWatcherGen or exitReason
+                if myGen ~= idleWatcherGen or exitReason then return end
                 if os.epoch("utc") - lastActivityMs > timeoutMs then
                     onIdle()
                     return
