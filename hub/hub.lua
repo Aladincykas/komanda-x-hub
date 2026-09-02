@@ -505,6 +505,21 @@ local function runVideoMenu(frame)
 
         if selectedVideo and not _G.KOMANDA_TERMINATED then
             videoplayer.play(mon, speakers, selectedVideo, config)
+            -- Basalt keeps its OWN cache of what it last drew to the
+            -- monitor and only ever sends the DIFF on the next draw() --
+            -- but videoplayer.play() draws every frame with raw mon.blit
+            -- calls that completely bypass Basalt, so that cache is now
+            -- totally stale (it still thinks the screen shows whatever
+            -- this video menu looked like before playback started).
+            -- Without this, rebuilding the exact same menu below looks to
+            -- Basalt like "nothing changed" and it skips writing most of
+            -- it to the screen -- confirmed in-game: the state machine
+            -- WAS correctly back on the video menu, it just wasn't
+            -- actually showing up, leaving the last video frame visible
+            -- underneath instead. frame:setTerm(mon) rebuilds Basalt's
+            -- render cache from scratch (blank), forcing every cell to be
+            -- treated as changed on the very next draw().
+            frame:setTerm(mon)
             -- loop back around: rebuild the list fresh after playback
         end
     end
