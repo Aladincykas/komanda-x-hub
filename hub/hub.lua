@@ -72,10 +72,18 @@ mainFrame:setBackground(colors.black)
 -- schedules persist across separate run() calls (the `schedules` table is
 -- never cleared between them), so this only needs to be registered once,
 -- here, and it keeps working for every screen after this point.
+-- Also quits on the Q key -- pressed at the COMPUTER's own terminal, not a
+-- touch on the monitor (a "key" event only fires from the Computer's
+-- keyboard; monitor taps are a completely separate "monitor_touch" event),
+-- so this only works standing at the Computer, on purpose -- registered
+-- once here, same as the terminate watcher above/below, so it works from
+-- any screen (main menu, video, music) without needing to be re-added
+-- anywhere else.
 _G.KOMANDA_TERMINATED = false
 basalt.schedule(function()
     while true do
-        if os.pullEventRaw() == "terminate" then
+        local event, key = os.pullEventRaw()
+        if event == "terminate" or (event == "key" and key == keys.q) then
             _G.KOMANDA_TERMINATED = true
             basalt.stop()
             return
@@ -240,25 +248,6 @@ local function runMainMenu(frame)
             basalt.stop()
         end)
 
-    -- Small "Quit" button, top-right corner, separate from the two main
-    -- buttons -- fully exits hub.lua back to the shell prompt (not just
-    -- back to this menu), for when you need to get to a prompt to edit or
-    -- delete files without having to open the Computer's own terminal and
-    -- find it to press Ctrl+T (which only works if that terminal has
-    -- keyboard focus in the first place -- this works by touching the
-    -- monitor itself).
-    local QUIT_W = 6
-    frame:addButton()
-        :setText("Quit")
-        :setPosition(w - QUIT_W + 1, 1)
-        :setSize(QUIT_W, 1)
-        :setBackground(colors.red)
-        :setForeground(colors.white)
-        :onClick(function()
-            chosen = "quit"
-            basalt.stop()
-        end)
-
     -- Force the very first real render now, before the matrix starts
     -- ticking below -- basalt.schedule() runs its function immediately
     -- (up to its first yield), so without this the matrix's first step
@@ -266,13 +255,17 @@ local function runMainMenu(frame)
     -- monitor.
     frame:draw()
 
+    -- Quitting is a Q keypress at the Computer's own keyboard now, not a
+    -- monitor button -- see the Q-key watcher near the top of this file
+    -- (main menu/music) and the matching handler in videoplayer.lua's input
+    -- loop (video playback, which runs its own raw event loop instead of
+    -- going through Basalt).
+
     -- The whole box (border + interior) needs to be off-limits to the
     -- rain, not just the individual text cells -- see the note above on
-    -- why the interior doesn't need its own separate fill. Same for the
-    -- Quit button's rectangle.
+    -- why the interior doesn't need its own separate fill.
     matrix:setExclusions({
         { boxX, boxY, boxX + boxW - 1, boxY + boxH - 1 },
-        { w - QUIT_W + 1, 1, w, 1 },
     })
 
     -- Background matrix rain, redrawn continuously behind the frame's

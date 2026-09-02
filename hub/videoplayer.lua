@@ -333,7 +333,21 @@ function M.play(mon, speakers, entry, config)
                         local action = nil
 
                         if event == "key" then
-                            if a == keys.space then action = "playpause"
+                            if a == keys.q then
+                                -- Global quit hotkey (Computer's own keyboard
+                                -- only, not the monitor) -- video playback
+                                -- runs its own raw event loop instead of
+                                -- Basalt's run(), so hub.lua's schedule-based
+                                -- Q watcher never gets resumed while a video
+                                -- is playing. Raising "Terminated" here reuses
+                                -- the exact propagation path plain os.pullEvent
+                                -- already uses for a real Ctrl+T (this same
+                                -- pcall boundary below already checks for and
+                                -- re-raises that string), so it exits exactly
+                                -- the same way, proven already to work.
+                                _G.KOMANDA_TERMINATED = true
+                                error("Terminated", 0)
+                            elseif a == keys.space then action = "playpause"
                             elseif a == keys.s then action = "stop"
                             elseif a == keys.left then action = "vol-1"
                             elseif a == keys.right then action = "vol+1"
