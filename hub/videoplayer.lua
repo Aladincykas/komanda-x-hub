@@ -248,6 +248,27 @@ function M.play(mon, speakers, entry, config)
         local lastPalette, lastRows = {}, {}
         local framesPlayed = 0
 
+        -- A plain Lua table, not os.queueEvent, hands audio chunks to the
+        -- dispatcher branch below. A previous version used
+        -- os.queueEvent("kx_audio_chunk", chunk) for this -- CC's event
+        -- queue is a single GLOBAL queue with no concept of "this chunk's
+        -- playback session", so when parallel.waitForAny tore the
+        -- dispatcher coroutine down the instant decoding finished (to move
+        -- on to the next .32vid chunk), any audio events still undelivered
+        -- at that moment didn't just get dropped -- they SURVIVED in the
+        -- queue and got picked up by the NEXT chunk's freshly-scheduled
+        -- dispatcher instead, playing stale leftover audio from the
+        -- previous chunk mixed in with the new one right at the boundary.
+        -- Confirmed in-game as exactly this: garbled/distorted sound right
+        -- when moving to the second chunk. A local table is naturally
+        -- scoped to just this chunk's playback call, and decodeFinished +
+        -- switching to parallel.waitForAll below (instead of waitForAny)
+        -- means this dispatcher now runs until its queue is FULLY drained
+        -- before the loop moves on, instead of being cut off mid-queue.
+        local audioQueue = {}
+        local audioQueueTail = 0
+        local decodeFinished = false
+
         local handlers = {
             shouldStop = function() return state.stopRequested end,
             onHeader = function(_, _, headerFps)
@@ -272,37 +293,50 @@ function M.play(mon, speakers, entry, config)
                 end
             end,
             onAudioChunk = function(chunk)
-                -- Hand the chunk off via a queued event instead of playing
-                -- it here directly -- decode/video pacing must never block
-                -- on a speaker. A previous version called speaker.playAudio
-                -- straight from here with no wait ("fire-and-forget", like
-                -- sanjuuni's own reference player) and confirmed in-game
-                -- that broke multi-speaker sync badly ("not every speaker
-                -- sound the same and gets delayed... completely shatted
-                -- system with speakers") -- the reference player is written
-                -- for ONE local speaker, not dozens of networked ones, so
-                -- its no-wait/no-retry assumption doesn't hold here. The
-                -- separate audio-dispatcher branch below restores the
-                -- known-good synchronized per-speaker ack+timeout dispatch,
-                -- decoupled from this decode/video loop via os.queueEvent
-                -- so a slow speaker still can't stall video pacing either.
+                -- Just enqueue and a wake ping -- decode/video pacing must
+                -- never block on a speaker. A previous version called
+                -- speaker.playAudio straight from here with no wait
+                -- ("fire-and-forget", like sanjuuni's own reference player)
+                -- and confirmed in-game that broke multi-speaker sync badly
+                -- ("not every speaker sound the same and gets delayed...
+                -- completely shatted system with speakers") -- the
+                -- reference player is written for ONE local speaker, not
+                -- dozens of networked ones, so its no-wait/no-retry
+                -- assumption doesn't hold here. The separate
+                -- audio-dispatcher branch below restores the known-good
+                -- synchronized per-speaker ack+timeout dispatch, decoupled
+                -- from this decode/video loop so a slow speaker still can't
+                -- stall video pacing either.
                 if state.stopRequested then return end
-                os.queueEvent("kx_audio_chunk", chunk)
+                audioQueueTail = audioQueueTail + 1
+                audioQueue[audioQueueTail] = chunk
+                os.queueEvent("kx_audio_wake")
             end,
         }
 
         local playOk, playErr = pcall(function()
-            parallel.waitForAny(
+            parallel.waitForAll(
                 function()
                     decodeModule.decode(file, handlers)
                     cumulativeSec = cumulativeSec + framesPlayed / fps
+                    decodeFinished = true
+                    os.queueEvent("kx_audio_wake") -- nudge the dispatcher in case it's idle-waiting
                 end,
-                function() -- audio dispatcher: consumes queued chunks, fans each out
+                function() -- audio dispatcher: drains the queue, fans each chunk out
                     -- to every networked speaker in sync (waits for each speaker's own
                     -- speaker_audio_empty ack, with a 3s per-speaker timeout so one dead
-                    -- speaker among many can't stall the others indefinitely).
-                    while not state.stopRequested do
-                        local _, chunk = os.pullEvent("kx_audio_chunk")
+                    -- speaker among many can't stall the others indefinitely). Keeps
+                    -- running until decode is done AND the queue is fully empty, so
+                    -- nothing from this chunk is ever cut short or bleeds into the next.
+                    local head = 1
+                    while true do
+                        while head > audioQueueTail do
+                            if state.stopRequested or decodeFinished then return end
+                            os.pullEvent("kx_audio_wake")
+                        end
+                        local chunk = audioQueue[head]
+                        audioQueue[head] = nil
+                        head = head + 1
                         if chunk and not state.stopRequested and #speakers > 0 then
                             local funcs = {}
                             for _, speaker in ipairs(speakers) do
@@ -328,7 +362,7 @@ function M.play(mon, speakers, entry, config)
                     end
                 end,
                 function() -- input handling: keyboard (at the Computer) and touch (at the monitor)
-                    while not state.stopRequested do
+                    while not state.stopRequested and not decodeFinished do
                         local event, a, b, c = os.pullEvent()
                         local action = nil
 
