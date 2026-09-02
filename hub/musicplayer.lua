@@ -119,6 +119,18 @@ function M.run(mon, speakers, config, frame)
     -- same as the rest of this session's transient UI state.
     local playlist = {}
 
+    -- Whether the Now Playing screen is showing controls or is immersive
+    -- (big equalizer, no buttons) -- a SHARED upvalue, not per-song state,
+    -- on purpose: each call to playSong() used to reset controlsVisible to
+    -- true, so a playlist auto-advancing to its next track would snap back
+    -- out of immersive mode on every single transition even though nobody
+    -- touched anything -- confirmed in-game as exactly that ("it resets
+    -- it"). Living here instead means the SAME immersive/compact choice
+    -- (and the touch-idle clock behind it) carries across every song in a
+    -- playlist, uninterrupted by track changes -- only an actual touch
+    -- changes it.
+    local sharedImmersive = { controlsVisible = true, lastTouchMs = os.epoch("utc") }
+
     -- Idle watcher: reusable, but scheduled FRESH inside whichever
     -- basalt.run() session is actually pumping events (once at the top of
     -- the library loop, once at the top of playSong), rather than trying to
@@ -275,8 +287,6 @@ function M.run(mon, speakers, config, frame)
             elapsedMs = 0,
             lastTickMs = os.epoch("utc"),
             volume = savedSettings.musicVolume or config.DEFAULT_VOLUME,
-            controlsVisible = true,
-            lastTouchMs = os.epoch("utc"),
         }
         local playReason = "finished" -- overwritten to "stopped" by Stop/back below
 
@@ -284,7 +294,7 @@ function M.run(mon, speakers, config, frame)
         local adjustVolume -- setVolume(delta) is a FRACTION of MAX_VOLUME (e.g. 0.05 = "+5%")
 
         -- Rebuilds the whole screen in either mode. Called once up front,
-        -- then again every time state.controlsVisible flips (a touch while
+        -- then again every time sharedImmersive.controlsVisible flips (a touch while
         -- immersive, or the 1-minute idle timeout below).
         local function drawNowPlaying()
             clearFrameChildren(frame)
@@ -298,7 +308,7 @@ function M.run(mon, speakers, config, frame)
 
             local nameY
 
-            if state.controlsVisible then
+            if sharedImmersive.controlsVisible then
                 -- Whole content block (song name, status, volume,
                 -- visualizer, controls) centered as one unit in the space
                 -- below the header and above the footer button, instead of
@@ -496,9 +506,9 @@ function M.run(mon, speakers, config, frame)
             while not state.stopRequested do
                 local event = os.pullEvent()
                 if event == "monitor_touch" or event == "mouse_click" then
-                    state.lastTouchMs = os.epoch("utc")
-                    if not state.controlsVisible then
-                        state.controlsVisible = true
+                    sharedImmersive.lastTouchMs = os.epoch("utc")
+                    if not sharedImmersive.controlsVisible then
+                        sharedImmersive.controlsVisible = true
                         drawNowPlaying()
                     end
                 end
@@ -600,8 +610,8 @@ function M.run(mon, speakers, config, frame)
                 -- controls and grows the visualizer -- see the touch
                 -- listener above for the reverse (any touch brings them
                 -- back immediately).
-                if state.controlsVisible and (nowMs - state.lastTouchMs) > IMMERSIVE_HIDE_MS then
-                    state.controlsVisible = false
+                if sharedImmersive.controlsVisible and (nowMs - sharedImmersive.lastTouchMs) > IMMERSIVE_HIDE_MS then
+                    sharedImmersive.controlsVisible = false
                     drawNowPlaying()
                 end
 

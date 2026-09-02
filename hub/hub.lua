@@ -199,6 +199,18 @@ local function runMainMenu(frame)
     local matrix = Matrix.new(mon)
     local chosen = nil
 
+    -- Same reasoning as the matching fix on this function's own return
+    -- path below (see the comment there) -- the matrix only ever paints
+    -- cells actively falling rain touches, it doesn't clear the whole
+    -- screen first. Coming back here from music/video, whatever that
+    -- screen last drew (Now Playing text, buttons, equalizer bars) would
+    -- otherwise sit there untouched until rain happened to fall through
+    -- those specific cells. mon.clear() wipes it immediately; setTerm
+    -- resets Basalt's cache so its own widgets get redrawn cleanly too.
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    frame:setTerm(mon)
+
     clearFrameChildren(frame)
 
     local title = config.TITLE:upper()
@@ -365,6 +377,27 @@ local function runMainMenu(frame)
     basalt.run()
 
     for _, speaker in ipairs(speakers) do pcall(speaker.stop) end
+
+    -- The matrix rain draws raw characters straight to the monitor with
+    -- mon.blit, completely bypassing Basalt's own render cache (same as
+    -- videoplayer.lua's raw frame blits -- see the matching fix/comment on
+    -- the video menu's own return path in runVideoMenu below). Basalt only
+    -- ever repaints cells where ONE OF ITS OWN widgets sits; leaving the
+    -- main menu for music or video, most of the screen has no widget on it
+    -- at all (empty background the matrix was raining through), so
+    -- whatever rain characters were sitting there when the user tapped a
+    -- button just stay there, visible, forever -- confirmed in-game as
+    -- exactly this: scattered leftover matrix characters bleeding through
+    -- onto the music player's Now Playing screen, in areas neither Basalt
+    -- nor the equalizer ever had a reason to touch. mon.clear() wipes the
+    -- physical screen; frame:setTerm(mon) resets Basalt's cache so the
+    -- very next draw() treats every cell as changed, so it doesn't
+    -- immediately skip repainting its own widgets thinking nothing's
+    -- different from what IT last remembers.
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    frame:setTerm(mon)
+
     if _G.KOMANDA_TERMINATED then return "quit" end
     return chosen or "video"
 end
@@ -571,7 +604,14 @@ local function runVideoMenu(frame)
             -- actually showing up, leaving the last video frame visible
             -- underneath instead. frame:setTerm(mon) rebuilds Basalt's
             -- render cache from scratch (blank), forcing every cell to be
-            -- treated as changed on the very next draw().
+            -- treated as changed on the very next draw(). Also mon.clear()
+            -- now (same pattern used around the main menu's matrix rain) --
+            -- the video menu's own widgets cover most of the screen so
+            -- this mattered less here, but any background cell they don't
+            -- happen to touch could otherwise still show a stray leftover
+            -- video pixel until something else overwrites it.
+            mon.setBackgroundColor(colors.black)
+            mon.clear()
             frame:setTerm(mon)
             -- loop back around: rebuild the list fresh after playback
         end
