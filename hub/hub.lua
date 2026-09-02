@@ -27,7 +27,20 @@ if not mon then error("Monitor '" .. config.MONITOR_NAME .. "' not found. Check 
 mon.setTextScale(config.MONITOR_TEXT_SCALE)
 local w, h = mon.getSize()
 
-local speakers = { peripheral.find("speaker") }
+-- CC:Tweaked hard-caps concurrent speaker playback at 8 speakers,
+-- network-wide -- this is a real engine limitation, not something fixable
+-- from Lua (see the open, unresolved upstream issue:
+-- https://github.com/cc-tweaked/CC-Tweaked/issues/1313). Wiring up more
+-- than 8 doesn't give you more simultaneous audio, it just makes behavior
+-- past the 8th one unpredictable -- confirmed in-game as real breakage
+-- ("plays only from one speaker") once past that point. Capping to the
+-- first MAX_SPEAKERS found keeps playback inside the documented
+-- known-working limit instead of exceeding it.
+local allSpeakers = { peripheral.find("speaker") }
+local speakers = {}
+for i = 1, math.min(#allSpeakers, config.MAX_SPEAKERS or 8) do
+    speakers[i] = allSpeakers[i]
+end
 if #speakers == 0 then
     error("No speakers found on the network. Check they're connected via modem.")
 end

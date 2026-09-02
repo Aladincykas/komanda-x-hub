@@ -48,4 +48,10 @@ return {
 
     DEFAULT_VOLUME = 1.0,
     MAX_VOLUME = 3.0, -- CC:Tweaked speaker.playAudio volume ceiling
+
+    -- CC:Tweaked hard-caps concurrent speaker playback at 8, network-wide --
+    -- a real engine limitation (see hub.lua's note where this is read), not
+    -- something this hub can work around. Extra speakers beyond this many
+    -- are simply ignored rather than used unreliably.
+    MAX_SPEAKERS = 8,
 }
