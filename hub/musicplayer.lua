@@ -216,7 +216,19 @@ function M.run(mon, speakers, config, frame)
     local IMMERSIVE_VIZ_COLS = math.min(w - 4, 66)
     local MAX_VIZ_COLS = math.max(COMPACT_VIZ_COLS, IMMERSIVE_VIZ_COLS)
     local COMPACT_VIZ_ROWS = math.max(5, math.floor(h * 0.3))
-    local VIZ_ROW_COLORS = { colors.red, colors.orange, colors.yellow, colors.lime, colors.green, colors.green } -- top -> bottom, last repeats if a mode needs more rows than this list
+    -- top -> bottom color band. Looked up PROPORTIONALLY (see
+    -- vizRowColor below), not by absolute row number -- a fixed lookup
+    -- capped at this list's length meant a tall immersive equalizer
+    -- crammed all the hot colors into just its first few rows and left
+    -- everything else solid green, confirmed in-game as genuinely
+    -- unbalanced-looking. Proportional scaling keeps the same balance
+    -- this had at the original 5-row size, at any size.
+    local VIZ_ROW_COLORS = { colors.red, colors.orange, colors.yellow, colors.lime, colors.green }
+    local function vizRowColor(r, totalRows)
+        local idx = math.ceil(r / totalRows * #VIZ_ROW_COLORS)
+        idx = math.max(1, math.min(#VIZ_ROW_COLORS, idx))
+        return VIZ_ROW_COLORS[idx]
+    end
     local vizHeights = {}
     for i = 1, MAX_VIZ_COLS do vizHeights[i] = 0 end
 
@@ -237,6 +249,21 @@ function M.run(mon, speakers, config, frame)
     local function playSong(song, backLabel)
         backLabel = backLabel or "Back to Library"
         local f = frame
+
+        -- Retires whichever idle watcher was running on the screen that
+        -- led into this song (library or playlist) WITHOUT starting a
+        -- replacement -- playback itself deliberately never gets its own
+        -- idle watcher (see the note by basalt.run() below). Bumping the
+        -- generation is enough on its own to make that old watcher notice
+        -- a mismatch and exit on its next event. Missing this was a real
+        -- bug: that watcher's own 300s timer kept running through playback
+        -- untouched, and once it fired it called basalt.stop() -- which
+        -- only ends the CURRENT basalt.run() (kicking the state machine
+        -- back to the main menu), it has no idea the DFPWM streaming
+        -- coroutine even exists, let alone that it should stop too. Result
+        -- (confirmed in-game): thrown back to the main menu mid-song while
+        -- the audio just kept on playing regardless.
+        idleWatcherGen = idleWatcherGen + 1
 
         -- Reassigned by drawNowPlaying() every time it (re)builds the
         -- screen -- compact vs immersive -- so the status-tick loop below
@@ -350,7 +377,7 @@ function M.run(mon, speakers, config, frame)
                         :setText((" "):rep(currentVizCols))
                         :setSize(currentVizCols, 1)
                         :setPosition(vizX, vizY + r - 1)
-                        :setForeground(VIZ_ROW_COLORS[r] or colors.green)
+                        :setForeground(vizRowColor(r, currentVizRows))
                         :setBackground(colors.black)
                 end
 
@@ -472,12 +499,11 @@ function M.run(mon, speakers, config, frame)
 
                 vizRowLabels = {}
                 for r = 1, currentVizRows do
-                    local colorIdx = math.min(r, #VIZ_ROW_COLORS)
                     vizRowLabels[r] = f:addLabel()
                         :setText((" "):rep(currentVizCols))
                         :setSize(currentVizCols, 1)
                         :setPosition(vizX, vizY + r - 1)
-                        :setForeground(VIZ_ROW_COLORS[colorIdx])
+                        :setForeground(vizRowColor(r, currentVizRows))
                         :setBackground(colors.black)
                 end
 
