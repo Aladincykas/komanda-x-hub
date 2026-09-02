@@ -35,6 +35,22 @@ end
 mon.setTextColor(colors.white)
 mon.setBackgroundColor(colors.black)
 
+-- The whole UI lives on the monitor -- this program never writes anything
+-- else to the Computer's OWN terminal, on purpose (that's what a kiosk
+-- setup is), which makes the Computer's screen look frozen/dead even while
+-- everything is working fine on the monitor. Print a plain static status
+-- line here so it's obvious at a glance the program actually started, and
+-- as a reminder of the Q-quit hotkey (see the watcher below and the
+-- matching handler in videoplayer.lua) without needing to already know it.
+term.clear()
+term.setCursorPos(1, 1)
+print(config.TITLE .. " is running.")
+print("Monitor: " .. config.MONITOR_NAME .. " (" .. w .. "x" .. h .. ")")
+print("Speakers found: " .. #speakers)
+print("")
+print("The menu/UI is on the monitor, not here.")
+print("Press Q on THIS keyboard any time to quit.")
+
 -- ONE Basalt frame for the whole hub, shared across every screen, instead
 -- of each screen creating its own via basalt.createFrame(mon). Two
 -- separate frame objects wrapping the SAME physical monitor each keep
