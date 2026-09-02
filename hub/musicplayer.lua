@@ -594,14 +594,18 @@ function M.run(mon, speakers, config, frame)
             end
         end)
 
-        startIdleWatcher(function()
-            exitReason = exitReason or "idle"
-            playReason = "stopped"
-            state.stopRequested = true
-            os.queueEvent("music_control")
-            for _, spk in ipairs(speakers) do pcall(spk.stop) end
-            basalt.stop()
-        end)
+        -- Deliberately NOT calling startIdleWatcher() here. Idle timeout
+        -- means "sitting on a menu, not doing anything" -- while a song
+        -- (or a whole playlist) is actively playing, the system genuinely
+        -- IS doing something even if nobody's touched the screen in a
+        -- while; that's normal listening, not idle. Confirmed in-game as a
+        -- real problem: playback got kicked back to the main menu mid-song
+        -- purely because nobody had touched anything, cutting off music
+        -- that was working exactly as intended. The idle watcher still
+        -- applies normally on the library/playlist/add-songs SELECTION
+        -- screens below (where sitting there really is doing nothing) --
+        -- it resumes the moment playback ends and one of those screens is
+        -- shown again.
 
         basalt.run()
         return playReason
