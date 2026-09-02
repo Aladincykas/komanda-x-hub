@@ -314,11 +314,33 @@ local function runMainMenu(frame)
                     while not chosen do
                         local chunk = response.read(16 * 1024)
                         if not chunk then break end
+                        -- Parallel dispatch to every speaker -- see the
+                        -- matching fix/comment in musicplayer.lua's
+                        -- playback loop for why the old sequential
+                        -- per-speaker loop caused real desync as more
+                        -- speakers were added.
                         local buffer = decoder(chunk)
-                        for _, speaker in ipairs(speakers) do
-                            while not chosen and not speaker.playAudio(buffer, config.MENU_MUSIC_VOLUME) do
-                                os.pullEvent("speaker_audio_empty")
+                        if #speakers > 0 then
+                            local funcs = {}
+                            for _, speaker in ipairs(speakers) do
+                                funcs[#funcs + 1] = function()
+                                    while not chosen and not speaker.playAudio(buffer, config.MENU_MUSIC_VOLUME) do
+                                        local timerId = os.startTimer(3)
+                                        local gaveUp = false
+                                        repeat
+                                            local ev, a = os.pullEvent()
+                                            if ev == "speaker_audio_empty" and a == peripheral.getName(speaker) then
+                                                break
+                                            elseif ev == "timer" and a == timerId then
+                                                gaveUp = true
+                                                break
+                                            end
+                                        until chosen
+                                        if gaveUp or chosen then break end
+                                    end
+                                end
                             end
+                            parallel.waitForAll(table.unpack(funcs))
                         end
                     end
                     response.close()

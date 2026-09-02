@@ -364,12 +364,42 @@ function M.run(mon, speakers, config, frame)
                 if not chunk then break end
                 state.elapsedBytes = state.elapsedBytes + #chunk
 
+                -- Dispatch to every speaker IN PARALLEL, not one at a time.
+                -- The old version looped speakers sequentially, each
+                -- blocking (potentially waiting on speaker_audio_empty)
+                -- before the NEXT speaker even got this chunk -- fine with
+                -- a couple of speakers, but the delay compounds with every
+                -- speaker added, and confirmed in-game as real desync once
+                -- more speakers joined ("not every speaker sound the
+                -- same and gets delayed"). Same fix already applied to
+                -- video playback's audio dispatch: fan out with
+                -- parallel.waitForAll, each speaker waiting only for ITS
+                -- OWN ack (filtered by peripheral name -- an unfiltered
+                -- wait could resume on a DIFFERENT speaker's empty event
+                -- and retry too early), with a 3s timeout so one dead
+                -- speaker among many can't stall the whole song.
                 local buffer = decoder(chunk)
-                for _, speaker in ipairs(speakers) do
-                    while not state.stopRequested and not speaker.playAudio(buffer, state.volume) do
-                        os.pullEvent("speaker_audio_empty")
+                if #speakers > 0 then
+                    local funcs = {}
+                    for _, speaker in ipairs(speakers) do
+                        funcs[#funcs + 1] = function()
+                            while not state.stopRequested and not speaker.playAudio(buffer, state.volume) do
+                                local timerId = os.startTimer(3)
+                                local gaveUp = false
+                                repeat
+                                    local ev, a = os.pullEvent()
+                                    if ev == "speaker_audio_empty" and a == peripheral.getName(speaker) then
+                                        break
+                                    elseif ev == "timer" and a == timerId then
+                                        gaveUp = true
+                                        break
+                                    end
+                                until state.stopRequested
+                                if gaveUp or state.stopRequested then break end
+                            end
+                        end
                     end
-                    if state.stopRequested then break end
+                    parallel.waitForAll(table.unpack(funcs))
                 end
             end
 
