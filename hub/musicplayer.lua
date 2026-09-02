@@ -187,18 +187,25 @@ function M.run(mon, speakers, config, frame)
     end
 
     -- ==== Now Playing screen ====
-    -- 5-row bar equalizer, old-media-player style: each of the VIZ_COLS
-    -- columns has its own random height 0-5, one addLabel per ROW (not per
-    -- cell -- that would be VIZ_COLS*5 elements, too many for a CC
-    -- computer to push every tick) built by concatenating a character per
-    -- column for that row. CC has no real audio-analysis API, so like the
-    -- original Pocket-Computer jukebox's equalizer this is decorative/
-    -- randomized while playing, not a real spectrum.
+    -- Bar equalizer, old-media-player style: each column has its own
+    -- random height, one addLabel per ROW (not per cell -- that would be
+    -- COLS*ROWS elements, too many for a CC computer to push every tick)
+    -- built by concatenating a character per column for that row. CC has
+    -- no real audio-analysis API, so like the original Pocket-Computer
+    -- jukebox's equalizer this is decorative/randomized while playing, not
+    -- a real spectrum.
     local VIZ_COLS = math.min(w - 4, 40)
-    local VIZ_ROWS = 5
-    local VIZ_ROW_COLORS = { colors.red, colors.orange, colors.yellow, colors.lime, colors.green } -- top -> bottom
+    local COMPACT_VIZ_ROWS = 5
+    local VIZ_ROW_COLORS = { colors.red, colors.orange, colors.yellow, colors.lime, colors.green, colors.green } -- top -> bottom, last repeats if immersive needs more rows than this list
     local vizHeights = {}
     for i = 1, VIZ_COLS do vizHeights[i] = 0 end
+
+    -- 1 minute of no touch on the Now Playing screen hides the controls
+    -- and grows the equalizer to fill the freed space -- confirmed
+    -- requested for every song play in the music player (library AND
+    -- playlist), not the video player. Tapping anywhere brings the
+    -- buttons/normal-size visuals straight back.
+    local IMMERSIVE_HIDE_MS = 60 * 1000
 
     -- backLabel: text for the footer button that returns without finishing
     -- the song (defaults to "Back to Library"; playlist playback passes
@@ -209,66 +216,21 @@ function M.run(mon, speakers, config, frame)
     -- auto-advance to the next track or stop the whole playlist.
     local function playSong(song, backLabel)
         backLabel = backLabel or "Back to Library"
-        clearFrameChildren(frame)
         local f = frame
 
-        f:addLabel()
-            :setText((" NOW PLAYING "):sub(1, w))
-            :setSize(w, 1)
-            :setPosition(1, 1)
-            :setForeground(colors.lime)
-            :setBackground(colors.gray)
-
-        -- Whole content block (song name, status, volume, visualizer,
-        -- controls) centered as one unit in the space below the header and
-        -- above the footer button, instead of hugging the top-left with a
-        -- lot of empty black space below (the "very very empty" complaint).
-        -- Real gaps (2 rows) between name/status/volume now too, instead
-        -- of them sitting directly on top of each other.
-        local buttonW = math.min(math.floor((w - 6) / 2), 16)
-        -- name(1) gap(2) status(1) gap(2) volume(1) gap(3) viz(VIZ_ROWS) gap(2) 4 button rows w/ 1-row gaps(7)
-        local BLOCK_HEIGHT = 1 + 2 + 1 + 2 + 1 + 3 + VIZ_ROWS + 2 + 7
-        local blockTop = math.max(3, math.floor((h - 1 - BLOCK_HEIGHT) / 2) + 1)
-        local nameY = blockTop
-        local statusY = nameY + 2
-        local volY = statusY + 2
-        local vizY = volY + 3
-        local btnRow1Y = vizY + VIZ_ROWS + 2
-        local btnRow2Y = btnRow1Y + 2
-        local btnRow3Y = btnRow2Y + 2
-        local btnRow4Y = btnRow3Y + 2
-
-        local vizX = math.max(1, math.floor((w - VIZ_COLS) / 2) + 1)
-        local bx = math.max(1, math.floor((w - (buttonW * 2 + 2)) / 2) + 1)
+        -- Reassigned by drawNowPlaying() every time it (re)builds the
+        -- screen -- compact vs immersive -- so the status-tick loop below
+        -- always reads whichever widgets/layout are CURRENTLY on screen,
+        -- never stale references from a mode that's since been rebuilt
+        -- away. playPauseBtn/volLabel are nil while immersive (no buttons
+        -- exist then); the tick loop below guards for that.
+        local nameLabel, statusLabel, volLabel, playPauseBtn, vizRowLabels, currentVizRows
+        local vizX, vizY
 
         local function centerLabel(label, y, text, color)
             label:setText(text)
             if color then label:setForeground(color) end
             label:setPosition(math.max(1, math.floor((w - #text) / 2) + 1), y)
-        end
-
-        local nameLabel = f:addLabel()
-            :setForeground(colors.white)
-            :setBackground(colors.black)
-        centerLabel(nameLabel, nameY, song.name:sub(1, w - 2))
-
-        local statusLabel = f:addLabel()
-            :setForeground(colors.white)
-            :setBackground(colors.black)
-        centerLabel(statusLabel, statusY, "Loading...")
-
-        local volLabel = f:addLabel()
-            :setForeground(colors.lime)
-            :setBackground(colors.black)
-
-        local vizRowLabels = {}
-        for r = 1, VIZ_ROWS do
-            vizRowLabels[r] = f:addLabel()
-                :setText((" "):rep(VIZ_COLS))
-                :setSize(VIZ_COLS, 1)
-                :setPosition(vizX, vizY + r - 1)
-                :setForeground(VIZ_ROW_COLORS[r])
-                :setBackground(colors.black)
         end
 
         -- Volume persists across songs/sessions (a saved settings file, not
@@ -292,117 +254,224 @@ function M.run(mon, speakers, config, frame)
             elapsedMs = 0,
             lastTickMs = os.epoch("utc"),
             volume = savedSettings.musicVolume or config.DEFAULT_VOLUME,
+            controlsVisible = true,
+            lastTouchMs = os.epoch("utc"),
         }
         local playReason = "finished" -- overwritten to "stopped" by Stop/back below
 
-        local function updateVolLabel()
-            local pct = math.floor(state.volume / config.MAX_VOLUME * 100 + 0.5)
-            centerLabel(volLabel, volY, ("Volume: %d%%"):format(pct))
+        local updateVolLabel -- defined below, referenced by drawNowPlaying
+        local adjustVolume -- setVolume(delta) is a FRACTION of MAX_VOLUME (e.g. 0.05 = "+5%")
+
+        -- Rebuilds the whole screen in either mode. Called once up front,
+        -- then again every time state.controlsVisible flips (a touch while
+        -- immersive, or the 1-minute idle timeout below).
+        local function drawNowPlaying()
+            clearFrameChildren(frame)
+
+            f:addLabel()
+                :setText((" NOW PLAYING "):sub(1, w))
+                :setSize(w, 1)
+                :setPosition(1, 1)
+                :setForeground(colors.lime)
+                :setBackground(colors.gray)
+
+            -- name/status sit at the same fixed spot in both modes -- only
+            -- the visualizer size and whether buttons exist differ.
+            local nameY, statusY = 3, 5
+            nameLabel = f:addLabel():setForeground(colors.white):setBackground(colors.black)
+            centerLabel(nameLabel, nameY, song.name:sub(1, w - 2))
+            statusLabel = f:addLabel():setForeground(colors.white):setBackground(colors.black)
+            centerLabel(statusLabel, statusY, "Loading...")
+
+            if state.controlsVisible then
+                -- Whole content block (song name, status, volume,
+                -- visualizer, controls) centered as one unit in the space
+                -- below the header and above the footer button, instead of
+                -- hugging the top-left with a lot of empty black space
+                -- below (the "very very empty" complaint). Real gaps
+                -- (2 rows) between name/status/volume, not stacked
+                -- directly on each other.
+                local buttonW = math.min(math.floor((w - 6) / 2), 16)
+                local volY = statusY + 2
+                vizY = volY + 3
+                currentVizRows = COMPACT_VIZ_ROWS
+                local btnRow1Y = vizY + currentVizRows + 2
+                local btnRow2Y = btnRow1Y + 2
+                local btnRow3Y = btnRow2Y + 2
+                local btnRow4Y = btnRow3Y + 2
+                vizX = math.max(1, math.floor((w - VIZ_COLS) / 2) + 1)
+                local bx = math.max(1, math.floor((w - (buttonW * 2 + 2)) / 2) + 1)
+
+                volLabel = f:addLabel():setForeground(colors.lime):setBackground(colors.black)
+
+                vizRowLabels = {}
+                for r = 1, currentVizRows do
+                    vizRowLabels[r] = f:addLabel()
+                        :setText((" "):rep(VIZ_COLS))
+                        :setSize(VIZ_COLS, 1)
+                        :setPosition(vizX, vizY + r - 1)
+                        :setForeground(VIZ_ROW_COLORS[r] or colors.green)
+                        :setBackground(colors.black)
+                end
+
+                function updateVolLabel()
+                    local pct = math.floor(state.volume / config.MAX_VOLUME * 100 + 0.5)
+                    centerLabel(volLabel, volY, ("Volume: %d%%"):format(pct))
+                end
+                updateVolLabel()
+
+                function adjustVolume(deltaFraction)
+                    local step = deltaFraction * config.MAX_VOLUME
+                    state.volume = math.max(0, math.min(config.MAX_VOLUME, state.volume + step))
+                    updateVolLabel()
+                    savedSettings.musicVolume = state.volume
+                    settings.save(savedSettings)
+                end
+
+                playPauseBtn = f:addButton()
+                    :setText(state.paused and "Play" or "Pause")
+                    :setPosition(bx, btnRow1Y)
+                    :setSize(buttonW, 1)
+                    :setBackground(colors.gray)
+                    :setForeground(colors.lime)
+                    :onClick(function(self)
+                        state.paused = not state.paused
+                        self:setText(state.paused and "Play" or "Pause")
+                        os.queueEvent("music_control")
+                    end)
+
+                f:addButton()
+                    :setText("Stop")
+                    :setPosition(bx + buttonW + 2, btnRow1Y)
+                    :setSize(buttonW, 1)
+                    :setBackground(colors.red)
+                    :setForeground(colors.white)
+                    :onClick(function()
+                        playReason = "stopped"
+                        state.stopRequested = true
+                        os.queueEvent("music_control")
+                    end)
+
+                f:addButton()
+                    :setText("Vol -1%")
+                    :setPosition(bx, btnRow2Y)
+                    :setSize(buttonW, 1)
+                    :setBackground(colors.gray)
+                    :setForeground(colors.lime)
+                    :onClick(function() adjustVolume(-0.01) end)
+
+                f:addButton()
+                    :setText("Vol +1%")
+                    :setPosition(bx + buttonW + 2, btnRow2Y)
+                    :setSize(buttonW, 1)
+                    :setBackground(colors.gray)
+                    :setForeground(colors.lime)
+                    :onClick(function() adjustVolume(0.01) end)
+
+                f:addButton()
+                    :setText("Vol -5%")
+                    :setPosition(bx, btnRow3Y)
+                    :setSize(buttonW, 1)
+                    :setBackground(colors.gray)
+                    :setForeground(colors.lime)
+                    :onClick(function() adjustVolume(-0.05) end)
+
+                f:addButton()
+                    :setText("Vol +5%")
+                    :setPosition(bx + buttonW + 2, btnRow3Y)
+                    :setSize(buttonW, 1)
+                    :setBackground(colors.gray)
+                    :setForeground(colors.lime)
+                    :onClick(function() adjustVolume(0.05) end)
+
+                f:addButton()
+                    :setText("Vol -20%")
+                    :setPosition(bx, btnRow4Y)
+                    :setSize(buttonW, 1)
+                    :setBackground(colors.gray)
+                    :setForeground(colors.lime)
+                    :onClick(function() adjustVolume(-0.20) end)
+
+                f:addButton()
+                    :setText("Vol +20%")
+                    :setPosition(bx + buttonW + 2, btnRow4Y)
+                    :setSize(buttonW, 1)
+                    :setBackground(colors.gray)
+                    :setForeground(colors.lime)
+                    :onClick(function() adjustVolume(0.20) end)
+
+                f:addButton()
+                    :setText(backLabel)
+                    :setPosition(2, h)
+                    :setSize(math.min(w - 2, 20), 1)
+                    :setBackground(colors.gray)
+                    :setForeground(colors.lime)
+                    :onClick(function()
+                        playReason = "stopped"
+                        state.stopRequested = true
+                        os.queueEvent("music_control")
+                    end)
+            else
+                -- Immersive: no buttons, no volume line -- the equalizer
+                -- fills nearly the whole screen instead, with just a hint
+                -- at the bottom for how to get the controls back.
+                volLabel = nil
+                playPauseBtn = nil
+                vizY = statusY + 2
+                currentVizRows = math.max(COMPACT_VIZ_ROWS, h - vizY - 2)
+                vizX = math.max(1, math.floor((w - VIZ_COLS) / 2) + 1)
+
+                vizRowLabels = {}
+                for r = 1, currentVizRows do
+                    local colorIdx = math.min(r, #VIZ_ROW_COLORS)
+                    vizRowLabels[r] = f:addLabel()
+                        :setText((" "):rep(VIZ_COLS))
+                        :setSize(VIZ_COLS, 1)
+                        :setPosition(vizX, vizY + r - 1)
+                        :setForeground(VIZ_ROW_COLORS[colorIdx])
+                        :setBackground(colors.black)
+                end
+
+                local hint = "Touch screen to show controls"
+                f:addLabel()
+                    :setText(hint)
+                    :setPosition(math.max(1, math.floor((w - #hint) / 2) + 1), h)
+                    :setForeground(colors.lightGray)
+                    :setBackground(colors.black)
+            end
+
+            f:draw()
         end
-        updateVolLabel()
 
-        -- setVolume(delta) where delta is a FRACTION of MAX_VOLUME (e.g.
-        -- 0.05 = "+5%"), not a raw volume unit, since that's how the step
-        -- size was asked for ("every 5 +/-", "every 20 +/-").
-        local function adjustVolume(deltaFraction)
-            local step = deltaFraction * config.MAX_VOLUME
-            state.volume = math.max(0, math.min(config.MAX_VOLUME, state.volume + step))
-            updateVolLabel()
-            savedSettings.musicVolume = state.volume
-            settings.save(savedSettings)
-        end
+        drawNowPlaying()
 
-        local playPauseBtn = f:addButton()
-            :setText("Pause")
-            :setPosition(bx, btnRow1Y)
-            :setSize(buttonW, 1)
-            :setBackground(colors.gray)
-            :setForeground(colors.lime)
-            :onClick(function(self)
-                state.paused = not state.paused
-                self:setText(state.paused and "Play" or "Pause")
-                os.queueEvent("music_control")
-            end)
-
-        f:addButton()
-            :setText("Stop")
-            :setPosition(bx + buttonW + 2, btnRow1Y)
-            :setSize(buttonW, 1)
-            :setBackground(colors.red)
-            :setForeground(colors.white)
-            :onClick(function()
-                playReason = "stopped"
-                state.stopRequested = true
-                os.queueEvent("music_control")
-            end)
-
-        f:addButton()
-            :setText("Vol -1%")
-            :setPosition(bx, btnRow2Y)
-            :setSize(buttonW, 1)
-            :setBackground(colors.gray)
-            :setForeground(colors.lime)
-            :onClick(function() adjustVolume(-0.01) end)
-
-        f:addButton()
-            :setText("Vol +1%")
-            :setPosition(bx + buttonW + 2, btnRow2Y)
-            :setSize(buttonW, 1)
-            :setBackground(colors.gray)
-            :setForeground(colors.lime)
-            :onClick(function() adjustVolume(0.01) end)
-
-        f:addButton()
-            :setText("Vol -5%")
-            :setPosition(bx, btnRow3Y)
-            :setSize(buttonW, 1)
-            :setBackground(colors.gray)
-            :setForeground(colors.lime)
-            :onClick(function() adjustVolume(-0.05) end)
-
-        f:addButton()
-            :setText("Vol +5%")
-            :setPosition(bx + buttonW + 2, btnRow3Y)
-            :setSize(buttonW, 1)
-            :setBackground(colors.gray)
-            :setForeground(colors.lime)
-            :onClick(function() adjustVolume(0.05) end)
-
-        f:addButton()
-            :setText("Vol -20%")
-            :setPosition(bx, btnRow4Y)
-            :setSize(buttonW, 1)
-            :setBackground(colors.gray)
-            :setForeground(colors.lime)
-            :onClick(function() adjustVolume(-0.20) end)
-
-        f:addButton()
-            :setText("Vol +20%")
-            :setPosition(bx + buttonW + 2, btnRow4Y)
-            :setSize(buttonW, 1)
-            :setBackground(colors.gray)
-            :setForeground(colors.lime)
-            :onClick(function() adjustVolume(0.20) end)
-
-        f:addButton()
-            :setText(backLabel)
-            :setPosition(2, h)
-            :setSize(math.min(w - 2, 20), 1)
-            :setBackground(colors.gray)
-            :setForeground(colors.lime)
-            :onClick(function()
-                playReason = "stopped"
-                state.stopRequested = true
-                os.queueEvent("music_control")
-            end)
-
-        f:draw()
+        -- Any touch anywhere on this screen counts as activity (resets the
+        -- 1-minute immersive timer) and, if currently immersive, brings
+        -- the controls back. Runs alongside Basalt's own button click
+        -- routing (which handles a button tap's actual effect first, same
+        -- broadcast-to-every-schedule event this project already relies on
+        -- elsewhere) -- this just separately tracks "was there ANY touch",
+        -- including taps that don't land on a button at all (the whole
+        -- point while immersive, since there ARE no buttons then).
+        safeSchedule(function()
+            while not state.stopRequested do
+                local event = os.pullEvent()
+                if event == "monitor_touch" or event == "mouse_click" then
+                    state.lastTouchMs = os.epoch("utc")
+                    if not state.controlsVisible then
+                        state.controlsVisible = true
+                        drawNowPlaying()
+                    end
+                end
+            end
+        end)
 
         safeSchedule(function()
             local response, err = http.get(song.url, nil, true)
             if not response then
-                centerLabel(statusLabel, statusY, "ERROR: " .. tostring(err))
+                centerLabel(statusLabel, 5, "ERROR: " .. tostring(err))
                 sleep(1.5)
+                state.stopRequested = true
                 basalt.stop()
                 return
             end
@@ -460,11 +529,23 @@ function M.run(mon, speakers, config, frame)
 
             response.close()
             for _, spk in ipairs(speakers) do pcall(spk.stop) end
+            -- Set even on a NATURAL end (the song just finished, nobody
+            -- pressed Stop) -- the touch-listener and status-tick
+            -- coroutines below both loop on "not state.stopRequested", and
+            -- without this they'd never notice the song ended and would
+            -- leak: still suspended, still getting resumed on every future
+            -- event for the rest of the session, the same class of bug
+            -- fixed elsewhere in this project (see hub.lua's video-menu
+            -- idle-watcher and this file's own idle-watcher generation
+            -- counter) -- this one was latent even before the touch
+            -- listener existed, since the tick loop below never checked
+            -- any exit condition at all.
+            state.stopRequested = true
             basalt.stop()
         end)
 
         safeSchedule(function()
-            while true do
+            while not state.stopRequested do
                 -- Real wall-clock elapsed time -- only advances while
                 -- actually playing (a real delta each tick, so pausing
                 -- genuinely freezes it instead of it drifting from
@@ -476,24 +557,35 @@ function M.run(mon, speakers, config, frame)
                 end
                 state.lastTickMs = nowMs
 
-                centerLabel(statusLabel, statusY,
+                -- 1 minute of no touch anywhere on this screen hides the
+                -- controls and grows the visualizer -- see the touch
+                -- listener above for the reverse (any touch brings them
+                -- back immediately).
+                if state.controlsVisible and (nowMs - state.lastTouchMs) > IMMERSIVE_HIDE_MS then
+                    state.controlsVisible = false
+                    drawNowPlaying()
+                end
+
+                centerLabel(statusLabel, 5,
                     (state.paused and "|| PAUSED  " or "> PLAYING  ") .. formatTime(state.elapsedMs / 1000))
-                playPauseBtn:setText(state.paused and "Play" or "Pause")
+                if playPauseBtn then playPauseBtn:setText(state.paused and "Play" or "Pause") end
 
                 -- Roll new random bar heights (only while actually playing,
                 -- so it goes still on pause instead of animating uselessly)
-                -- and redraw all VIZ_ROWS at once.
+                -- and redraw all rows at once. currentVizRows/vizRowLabels
+                -- always reflect whichever mode drawNowPlaying() last
+                -- built, compact or immersive.
                 if not state.paused then
                     for c = 1, VIZ_COLS do
-                        vizHeights[c] = math.random(0, VIZ_ROWS)
+                        vizHeights[c] = math.random(0, currentVizRows)
                     end
                 end
-                for r = 1, VIZ_ROWS do
+                for r = 1, currentVizRows do
                     local chars = {}
                     for c = 1, VIZ_COLS do
                         -- row 1 is the TOP of the bar, so a column needs
-                        -- height >= (VIZ_ROWS - r + 1) to reach this row.
-                        chars[c] = (vizHeights[c] >= (VIZ_ROWS - r + 1)) and "#" or " "
+                        -- height >= (currentVizRows - r + 1) to reach this row.
+                        chars[c] = (vizHeights[c] >= (currentVizRows - r + 1)) and "#" or " "
                     end
                     vizRowLabels[r]:setText(table.concat(chars))
                 end
