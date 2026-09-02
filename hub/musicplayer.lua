@@ -186,6 +186,85 @@ function M.run(mon, speakers, config, frame)
         end)
     end
 
+    -- ==== Playback helpers (used by playSong's crossfade-aware loop) ====
+
+    -- Opens a DFPWM stream for a song URL: stream.next() returns the next
+    -- decoded PCM buffer or nil at EOF, stream.close() releases the HTTP
+    -- response. Wrapping this as a reusable object (rather than the old
+    -- inline http.get+decoder loop) lets the playback loop below have TWO
+    -- of these open at once during a crossfade -- one finishing the
+    -- current song, one starting the next.
+    local function openSongStream(url)
+        local response, err = http.get(url, nil, true)
+        if not response then return nil, err end
+        local decoder = dfpwm.make_decoder()
+        local chunkSize = 16 * 1024
+        local stream = { closed = false }
+        function stream.next()
+            local raw = response.read(chunkSize)
+            if not raw then return nil end
+            return decoder(raw)
+        end
+        function stream.close()
+            if not stream.closed then
+                stream.closed = true
+                pcall(response.close)
+            end
+        end
+        return stream
+    end
+
+    -- Linearly crossfades bufOut (fading out) into bufIn (fading in),
+    -- sample-by-sample, over however many samples the two share. A linear
+    -- blend's two weights always sum to 1, so the mixed sample can never
+    -- exceed either original's range -- no clipping/overflow guard needed.
+    -- Whichever buffer is longer contributes its own remaining tail
+    -- unblended, so no audio from either buffer is ever dropped.
+    local function crossfadeMix(bufOut, bufIn)
+        local fadeLen = math.min(#bufOut, #bufIn)
+        local mixed = {}
+        for i = 1, fadeLen do
+            local gainIn = (i - 1) / fadeLen
+            local gainOut = 1 - gainIn
+            mixed[i] = math.floor(bufOut[i] * gainOut + bufIn[i] * gainIn + 0.5)
+        end
+        if #bufOut > fadeLen then
+            for i = fadeLen + 1, #bufOut do mixed[i] = bufOut[i] end
+        elseif #bufIn > fadeLen then
+            for i = fadeLen + 1, #bufIn do mixed[i] = bufIn[i] end
+        end
+        return mixed
+    end
+
+    -- Fans `buffer` out to every networked speaker in parallel, each
+    -- waiting for its own speaker_audio_empty ack (3s per-speaker timeout
+    -- so one dead speaker can't stall the others). Same dispatch pattern
+    -- used everywhere else in this project (hub.lua's menu music,
+    -- videoplayer.lua's audio dispatcher).
+    local function dispatchToSpeakers(state, buffer)
+        if #speakers == 0 then return end
+        local funcs = {}
+        for _, speaker in ipairs(speakers) do
+            funcs[#funcs + 1] = function()
+                while not state.stopRequested and not speaker.playAudio(buffer, state.volume) do
+                    local timerId = os.startTimer(3)
+                    local gaveUp = false
+                    repeat
+                        local ev, a = os.pullEvent()
+                        if ev == "speaker_audio_empty" and a == peripheral.getName(speaker) then
+                            break
+                        elseif ev == "timer" and a == timerId then
+                            gaveUp = true
+                            break
+                        end
+                    until state.stopRequested
+                    if gaveUp or state.stopRequested then break end
+                end
+            end
+        end
+        parallel.waitForAll(table.unpack(funcs))
+    end
+
     -- ==== Now Playing screen ====
     -- 5-row bar equalizer, old-media-player style: each of the VIZ_COLS
     -- columns has its own random height 0-5, one addLabel per ROW (not per
@@ -203,11 +282,32 @@ function M.run(mon, speakers, config, frame)
     -- backLabel: text for the footer button that returns without finishing
     -- the song (defaults to "Back to Library"; playlist playback passes
     -- "Back to Playlist" instead so the label matches where it actually
-    -- goes back to). Returns "finished" if the song played to the end on
-    -- its own, or "stopped" if the user hit Stop/the back button -- the
-    -- playlist-playback loop below uses this to decide whether to
-    -- auto-advance to the next track or stop the whole playlist.
-    local function playSong(song, backLabel)
+    -- goes back to).
+    --
+    -- queue/queueIndex (both optional, only passed by playlist "Play All"):
+    -- when given, this ONE call plays `song` and then internally keeps
+    -- going through queue[queueIndex+1], queue[queueIndex+2], ... on its
+    -- own, crossfading between each pair -- it does NOT return between
+    -- songs. Library plays omit these (nil), so a single song just plays
+    -- and ends normally, no crossfade, exactly as before.
+    --
+    -- The crossfade itself: this song's stream is always read one chunk
+    -- AHEAD of what's actually been dispatched to the speakers, so by the
+    -- time a chunk turns out to be the LAST one (the next read hits EOF),
+    -- that final chunk hasn't been played yet -- there's still time to
+    -- open the next song's stream, grab ITS first chunk, and blend the two
+    -- into one mixed buffer (see crossfadeMix above) before dispatching,
+    -- instead of playing the tail alone and starting the next song from
+    -- silence. There's no stored duration anywhere to plan a fade ahead of
+    -- time, so this reacts to hitting the actual end of the stream rather
+    -- than pre-scheduling a fade at some known timestamp -- the one-chunk
+    -- lookahead is what makes that possible at all (a fixed ~16KB/~2.7s
+    -- DFPWM chunk, so the crossfade itself runs about that long).
+    --
+    -- Returns "finished" if playback reached the end of the WHOLE queue
+    -- (or the single song, with no queue) on its own, or "stopped" if the
+    -- user hit Stop/the back button, or an idle timeout fired.
+    local function playSong(song, backLabel, queue, queueIndex)
         backLabel = backLabel or "Back to Library"
         clearFrameChildren(frame)
         local f = frame
@@ -399,66 +499,104 @@ function M.run(mon, speakers, config, frame)
         f:draw()
 
         safeSchedule(function()
-            local response, err = http.get(song.url, nil, true)
-            if not response then
+            local curSong = song
+            local curIdx = queueIndex
+
+            local stream, err = openSongStream(curSong.url)
+            if not stream then
                 centerLabel(statusLabel, statusY, "ERROR: " .. tostring(err))
                 sleep(1.5)
                 basalt.stop()
                 return
             end
 
-            local decoder = dfpwm.make_decoder()
-            local chunkSize = 16 * 1024
+            -- One-chunk lookahead: `pending` is always the chunk about to
+            -- be dispatched, already fetched one step ahead so we find out
+            -- a chunk was the LAST one (the next read is nil) before
+            -- dispatching it -- see playSong's header comment above for
+            -- why this is what makes crossfading possible without knowing
+            -- any song's duration in advance.
+            local pending = stream.next()
 
-            while not state.stopRequested do
+            while pending and not state.stopRequested do
                 while state.paused and not state.stopRequested do
                     os.pullEvent("music_control")
                 end
                 if state.stopRequested then break end
 
-                local chunk = response.read(chunkSize)
-                if not chunk then break end
+                local lookahead = stream.next()
 
-                -- Dispatch to every speaker IN PARALLEL, not one at a time.
-                -- The old version looped speakers sequentially, each
-                -- blocking (potentially waiting on speaker_audio_empty)
-                -- before the NEXT speaker even got this chunk -- fine with
-                -- a couple of speakers, but the delay compounds with every
-                -- speaker added, and confirmed in-game as real desync once
-                -- more speakers joined ("not every speaker sound the
-                -- same and gets delayed"). Same fix already applied to
-                -- video playback's audio dispatch: fan out with
-                -- parallel.waitForAll, each speaker waiting only for ITS
-                -- OWN ack (filtered by peripheral name -- an unfiltered
-                -- wait could resume on a DIFFERENT speaker's empty event
-                -- and retry too early), with a 3s timeout so one dead
-                -- speaker among many can't stall the whole song.
-                local buffer = decoder(chunk)
-                if #speakers > 0 then
-                    local funcs = {}
-                    for _, speaker in ipairs(speakers) do
-                        funcs[#funcs + 1] = function()
-                            while not state.stopRequested and not speaker.playAudio(buffer, state.volume) do
-                                local timerId = os.startTimer(3)
-                                local gaveUp = false
-                                repeat
-                                    local ev, a = os.pullEvent()
-                                    if ev == "speaker_audio_empty" and a == peripheral.getName(speaker) then
-                                        break
-                                    elseif ev == "timer" and a == timerId then
-                                        gaveUp = true
-                                        break
-                                    end
-                                until state.stopRequested
-                                if gaveUp or state.stopRequested then break end
-                            end
+                if lookahead then
+                    dispatchToSpeakers(state, pending)
+                    pending = lookahead
+                else
+                    -- `pending` is the final chunk of curSong -- resolve
+                    -- the transition to whatever comes next. This is a
+                    -- loop, not a single step: a song whose ENTIRE content
+                    -- is exactly one chunk long has that one chunk be
+                    -- BOTH its first and its own last, so it gets fully
+                    -- consumed as the fade-IN target below with nothing
+                    -- left for a further lookahead read -- without
+                    -- looping here, that would incorrectly look like "no
+                    -- more audio" and stop the whole queue early, silently
+                    -- dropping every song after a short one. Looping lets
+                    -- a chunk-or-shorter song crossfade in AND immediately
+                    -- back out into whatever follows it, instead of
+                    -- stalling. (Caught by a dedicated test during
+                    -- development, not just by inspection.)
+                    stream.close()
+                    stream = nil
+                    local finalChunk = pending
+                    pending = nil
+
+                    while true do
+                        if state.stopRequested then break end
+                        local nextSong = queue and queue[curIdx + 1]
+                        if not nextSong then
+                            -- Last song in the queue (or no queue at all
+                            -- -- a single library play).
+                            dispatchToSpeakers(state, finalChunk)
+                            break
                         end
+
+                        local nextStream = openSongStream(nextSong.url)
+                        local nextFirst = nextStream and nextStream.next()
+                        if not nextFirst then
+                            -- Next song failed to open or was empty --
+                            -- still finish playing the current tail
+                            -- normally rather than losing it, then stop.
+                            dispatchToSpeakers(state, finalChunk)
+                            if nextStream then nextStream.close() end
+                            break
+                        end
+
+                        dispatchToSpeakers(state, crossfadeMix(finalChunk, nextFirst))
+                        curSong = nextSong
+                        curIdx = curIdx + 1
+                        centerLabel(nameLabel, nameY, curSong.name:sub(1, w - 2))
+                        state.elapsedMs = 0
+                        state.lastTickMs = os.epoch("utc")
+
+                        local afterFirst = nextStream.next()
+                        if afterFirst then
+                            stream = nextStream
+                            pending = afterFirst
+                            break
+                        end
+
+                        -- curSong (just transitioned into) was ALSO only
+                        -- one chunk long -- its whole content is already
+                        -- represented above (crossfaded in). Chain
+                        -- straight into whatever comes after IT, fading
+                        -- out of that same one chunk, rather than
+                        -- stopping here.
+                        nextStream.close()
+                        finalChunk = nextFirst
                     end
-                    parallel.waitForAll(table.unpack(funcs))
                 end
             end
 
-            response.close()
+            if stream then stream.close() end
             for _, spk in ipairs(speakers) do pcall(spk.stop) end
             basalt.stop()
         end)
@@ -888,12 +1026,10 @@ function M.run(mon, speakers, config, frame)
             elseif playlistAction == "back" then
                 screen = "library"
             elseif playlistAction == "play" and #playlist > 0 and not _G.KOMANDA_TERMINATED then
-                local i = 1
-                while i <= #playlist and not exitReason and not _G.KOMANDA_TERMINATED do
-                    local reason = playSong(playlist[i], "Back to Playlist")
-                    if reason ~= "finished" then break end
-                    i = i + 1
-                end
+                -- ONE call now plays the whole queue, crossfading between
+                -- songs internally -- see playSong's header comment for
+                -- why. No need to loop and re-invoke it per song anymore.
+                playSong(playlist[1], "Back to Playlist", playlist, 1)
                 -- Whether it played through to the end, got stopped, or
                 -- one song errored out, land back on the playlist screen
                 -- (not the library) -- exitReason (idle/quit/menu) still
