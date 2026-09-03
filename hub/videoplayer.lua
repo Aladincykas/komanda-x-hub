@@ -321,14 +321,29 @@ function M.play(mon, speakers, entry, config)
         end
     end
 
+    -- Only the FIRST chunk is a real wait. Every chunk after it is fetched in
+    -- the background while the previous one is still playing (see the prefetch
+    -- branch in the parallel block below), so there is no "Loading part N/M"
+    -- pause between them -- the video simply keeps going.
+    --
+    -- This player has no fixed segment length any more, so chunks can be
+    -- minutes long; but however long they are, every boundary used to stop the
+    -- picture dead while the next one downloaded.
+    drawLoading(mon, w, h, ("Loading %s..."):format(entry.name))
+    local file = fetchChunkToMemory(entry.chunks[1])
+    local nextFile = nil
+
     local function videoLoop()
         for chunkIndex, url in ipairs(entry.chunks) do
             if state.stopRequested then break end
 
-            drawLoading(mon, w, h, ("Loading %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
-
-            local file = fetchChunkToMemory(url)
-            drawLoading(mon, w, h, ("Decoding %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
+            -- Normally already prefetched. This only runs when a prefetch
+            -- failed -- it is pcall'd below, so a hiccup downgrades to fetching
+            -- here (with the loading message) rather than killing playback.
+            if not file then
+                drawLoading(mon, w, h, ("Loading %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
+                file = fetchChunkToMemory(url)
+            end
 
             local buttons = buildButtonLayout(w, h, math.floor(w / 2) + 1)
 
@@ -521,6 +536,15 @@ function M.play(mon, speakers, entry, config)
                             elseif action == "vol+10" then adjustVolume(0.10)
                             end
                         end
+                    end,
+                    function() -- prefetch the NEXT chunk while this one plays
+                        local nextUrl = entry.chunks[chunkIndex + 1]
+                        if not nextUrl then return end
+                        -- pcall'd on purpose: a failed prefetch must not take
+                        -- down playback of the chunk currently on screen. The
+                        -- loop just fetches it normally next time round.
+                        local ok, result = pcall(fetchChunkToMemory, nextUrl)
+                        if ok then nextFile = result end
                     end
                 )
             end)
@@ -557,6 +581,10 @@ function M.play(mon, speakers, entry, config)
                 result = "stopped"
                 break
             end
+
+            -- Hand the already-downloaded next chunk to the next iteration.
+            file = nextFile
+            nextFile = nil
         end
         videoDone = true
     end
