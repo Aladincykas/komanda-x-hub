@@ -132,12 +132,24 @@ end)
 -- in its own pcall means each one independently notices its own
 -- termination and cooperatively sets the flag + stops, regardless of
 -- what order Basalt happens to resume them in.
+-- Records what actually went wrong instead of discarding it.
+--
+-- This used to swallow the error and simply stop Basalt, which made every
+-- background failure look identical from outside: the monitor freezes on its
+-- last drawn frame, because nothing is repainting any more, and the hub
+-- carries on to whatever screen the caller defaults to. There was no way to
+-- tell a dead matrix-rain coroutine from a dead menu-music one, or either
+-- from a normal exit -- so the error is kept here and surfaced by the state
+-- machine at the bottom of this file.
+_G.KOMANDA_LAST_ERROR = nil
 local function safeSchedule(fn)
     return basalt.schedule(function()
         local ok, err = pcall(fn)
         if not ok then
             if tostring(err):find("Terminated") then
                 _G.KOMANDA_TERMINATED = true
+            else
+                _G.KOMANDA_LAST_ERROR = tostring(err)
             end
             pcall(basalt.stop)
         end
@@ -437,6 +449,11 @@ local function runMainMenu(frame)
     frame:setTerm(mon)
 
     if _G.KOMANDA_TERMINATED then return "quit" end
+    -- A background task died rather than the user choosing anything. Say so,
+    -- instead of falling through to a screen nobody asked for: defaulting to
+    -- "video" here meant a crashed menu silently opened the video list, which
+    -- reads as the menu acting on its own.
+    if _G.KOMANDA_LAST_ERROR then return "error" end
     return chosen or "video"
 end
 
@@ -662,10 +679,27 @@ end
 while not _G.KOMANDA_TERMINATED do
     local target = runMainMenu(mainFrame)
     if target == "quit" or _G.KOMANDA_TERMINATED then break end
-    if target == "video" then
+
+    if target == "error" then
+        -- Printed on the COMPUTER's own terminal rather than the monitor: the
+        -- monitor still holds the frozen frame, and Basalt owns that surface.
+        local err = _G.KOMANDA_LAST_ERROR
+        _G.KOMANDA_LAST_ERROR = nil
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.red)
+        term.clear()
+        term.setCursorPos(1, 1)
+        print("A background task failed:")
+        print(tostring(err))
+        term.setTextColor(colors.white)
+        print("")
+        print("Press any key to return to the menu.")
+        os.pullEvent("key")
+    elseif target == "video" then
         runVideoMenu(mainFrame) -- returns on "menu" (Back button), "idle", or "quit" -> main menu (or exit, below)
-    else
+    elseif target == "music" then
         local musicplayer = require("musicplayer") -- loaded on first entry to this screen only
         musicplayer.run(mon, speakers, config, mainFrame) -- returns on "menu", "idle", or "quit" -> main menu (or exit, below)
     end
+    -- Anything else loops back to the menu rather than guessing at intent.
 end
