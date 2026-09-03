@@ -214,235 +214,371 @@ function M.play(mon, speakers, entry, config)
     local cumulativeSec = 0
     local result = "done"
 
-    for chunkIndex, url in ipairs(entry.chunks) do
-        if state.stopRequested then break end
+    -- Videos encoded from 2026-09-03 onward carry their audio as separate
+    -- .dfpwm files (entry.audio) instead of interleaving it into the .32vid.
+    --
+    -- Interleaved audio can only be produced as fast as video frames are
+    -- decoded AND drawn, so anything that slows rendering starves the
+    -- speakers. On the 12-monitor wall that was constant; here, at 71x38, it
+    -- is occasional -- a lag spike or a slow fetch is enough. Same coupling,
+    -- different frequency, and this removes it: the audio coroutine reads its
+    -- own HTTP response at its own pace and nothing the renderer does can
+    -- interrupt it.
+    --
+    -- Videos without entry.audio still use the interleaved path below, so an
+    -- existing library keeps playing untouched.
+    local hasSeparateAudio = type(entry.audio) == "table" and #entry.audio > 0
+    -- DFPWM is one bit per sample at 48kHz: exactly 6000 bytes per second of
+    -- sound, always. That makes byte offsets and playback position the same
+    -- arithmetic, with no timers involved.
+    local DFPWM_BYTES_PER_SECOND = 6000
+    local videoDone = false
 
-        drawLoading(mon, w, h, ("Loading %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
-
-        local file = fetchChunkToMemory(url)
-        drawLoading(mon, w, h, ("Decoding %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
-
-        local buttons = buildButtonLayout(w, h, math.floor(w / 2) + 1)
-
-        local function saveVolume()
-            savedSettings.videoVolume = state.volume
-            settings.save(savedSettings)
-        end
-        local function adjustVolume(deltaFraction)
-            local step = deltaFraction * state.maxVolume
-            state.volume = math.max(0, math.min(state.maxVolume, state.volume + step))
-            saveVolume()
-        end
-
-        -- Streaming decode+play: decodeModule.decode() calls these
-        -- handlers inline as it reads through the chunk, one record at a
-        -- time (see vendor/32vid-decode.lua's header comment for why this
-        -- replaced the old decode-everything-into-arrays-first approach).
-        -- Video frames are paced to fps and drawn here; audio chunks are
-        -- fired at every speaker with no wait/retry, exactly like
-        -- sanjuuni's own reference player -- the video pacing (interleaved
-        -- with audio records in file order) is what keeps playback roughly
-        -- real-time, not a separate acknowledgment-based audio clock.
-        local fps = 10
-        local frameStart = os.epoch("utc")
-        local lastPalette, lastRows = {}, {}
-        local framesPlayed = 0
-
-        -- A plain Lua table, not os.queueEvent, hands audio chunks to the
-        -- dispatcher branch below. A previous version used
-        -- os.queueEvent("kx_audio_chunk", chunk) for this -- CC's event
-        -- queue is a single GLOBAL queue with no concept of "this chunk's
-        -- playback session", so when parallel.waitForAny tore the
-        -- dispatcher coroutine down the instant decoding finished (to move
-        -- on to the next .32vid chunk), any audio events still undelivered
-        -- at that moment didn't just get dropped -- they SURVIVED in the
-        -- queue and got picked up by the NEXT chunk's freshly-scheduled
-        -- dispatcher instead, playing stale leftover audio from the
-        -- previous chunk mixed in with the new one right at the boundary.
-        -- Confirmed in-game as exactly this: garbled/distorted sound right
-        -- when moving to the second chunk. A local table is naturally
-        -- scoped to just this chunk's playback call, and decodeFinished +
-        -- switching to parallel.waitForAll below (instead of waitForAny)
-        -- means this dispatcher now runs until its queue is FULLY drained
-        -- before the loop moves on, instead of being cut off mid-queue.
-        local audioQueue = {}
-        local audioQueueTail = 0
-        local decodeFinished = false
-
-        local handlers = {
-            shouldStop = function() return state.stopRequested end,
-            onHeader = function(_, _, headerFps)
-                fps = headerFps
-                frameStart = os.epoch("utc")
-            end,
-            onVideoFrame = function(frame, frameIndex)
-                while state.paused and not state.stopRequested do
-                    os.pullEvent("video_control")
-                    frameStart = os.epoch("utc") - (frameIndex - 1) / fps * 1000 -- resume timing cleanly
-                end
-                if state.stopRequested then return end
-
-                drawFrame(mon, frame, lastPalette, lastRows)
-                state.elapsedSec = cumulativeSec + (frameIndex - 1) / fps
-                drawControls(mon, w, h, state, entry.durationSec or 0, buttons)
-                framesPlayed = frameIndex
-
-                while os.epoch("utc") < frameStart + (frameIndex + 1) / fps * 1000 do
-                    os.sleep(1 / fps)
-                    if state.stopRequested then break end
-                end
-            end,
-            onAudioChunk = function(chunk)
-                -- Just enqueue and a wake ping -- decode/video pacing must
-                -- never block on a speaker. A previous version called
-                -- speaker.playAudio straight from here with no wait
-                -- ("fire-and-forget", like sanjuuni's own reference player)
-                -- and confirmed in-game that broke multi-speaker sync badly
-                -- ("not every speaker sound the same and gets delayed...
-                -- completely shatted system with speakers") -- the
-                -- reference player is written for ONE local speaker, not
-                -- dozens of networked ones, so its no-wait/no-retry
-                -- assumption doesn't hold here. The separate
-                -- audio-dispatcher branch below restores the known-good
-                -- synchronized per-speaker ack+timeout dispatch, decoupled
-                -- from this decode/video loop so a slow speaker still can't
-                -- stall video pacing either.
-                if state.stopRequested then return end
-                audioQueueTail = audioQueueTail + 1
-                audioQueue[audioQueueTail] = chunk
-                os.queueEvent("kx_audio_wake")
-            end,
-        }
-
-        local playOk, playErr = pcall(function()
-            parallel.waitForAll(
-                function()
-                    decodeModule.decode(file, handlers)
-                    cumulativeSec = cumulativeSec + framesPlayed / fps
-                    decodeFinished = true
-                    os.queueEvent("kx_audio_wake") -- nudge the dispatcher in case it's idle-waiting
-                end,
-                function() -- audio dispatcher: drains the queue, fans each chunk out
-                    -- to every networked speaker in sync (waits for each speaker's own
-                    -- speaker_audio_empty ack, with a 3s per-speaker timeout so one dead
-                    -- speaker among many can't stall the others indefinitely). Keeps
-                    -- running until decode is done AND the queue is fully empty, so
-                    -- nothing from this chunk is ever cut short or bleeds into the next.
-                    local head = 1
-                    while true do
-                        while head > audioQueueTail do
-                            if state.stopRequested or decodeFinished then return end
-                            os.pullEvent("kx_audio_wake")
-                        end
-                        local chunk = audioQueue[head]
-                        audioQueue[head] = nil
-                        head = head + 1
-                        if chunk and not state.stopRequested and #speakers > 0 then
-                            local funcs = {}
-                            for _, speaker in ipairs(speakers) do
-                                funcs[#funcs + 1] = function()
-                                    while not state.stopRequested and not speaker.playAudio(chunk, state.volume) do
-                                        local timerId = os.startTimer(3)
-                                        local gaveUp = false
-                                        repeat
-                                            local ev2, a = os.pullEvent()
-                                            if ev2 == "speaker_audio_empty" and a == peripheral.getName(speaker) then
-                                                break
-                                            elseif ev2 == "timer" and a == timerId then
-                                                gaveUp = true
-                                                break
-                                            end
-                                        until state.stopRequested
-                                        if gaveUp or state.stopRequested then break end
-                                    end
-                                end
-                            end
-                            parallel.waitForAll(table.unpack(funcs))
-                        end
-                    end
-                end,
-                function() -- input handling: keyboard (at the Computer) and touch (at the monitor)
-                    while not state.stopRequested and not decodeFinished do
-                        local event, a, b, c = os.pullEvent()
-                        local action = nil
-
-                        if event == "key" then
-                            if a == keys.q then
-                                -- Global quit hotkey (Computer's own keyboard
-                                -- only, not the monitor) -- video playback
-                                -- runs its own raw event loop instead of
-                                -- Basalt's run(), so hub.lua's schedule-based
-                                -- Q watcher never gets resumed while a video
-                                -- is playing. Raising "Terminated" here reuses
-                                -- the exact propagation path plain os.pullEvent
-                                -- already uses for a real Ctrl+T (this same
-                                -- pcall boundary below already checks for and
-                                -- re-raises that string), so it exits exactly
-                                -- the same way, proven already to work.
-                                _G.KOMANDA_TERMINATED = true
-                                error("Terminated", 0)
-                            elseif a == keys.space then action = "playpause"
-                            elseif a == keys.s then action = "stop"
-                            elseif a == keys.left then action = "vol-1"
-                            elseif a == keys.right then action = "vol+1"
-                            end
-                        elseif event == "monitor_touch" then
-                            local idx = hitTestButton(buttons, b, c)
-                            if idx == 1 then action = "playpause"
-                            elseif idx == 2 then action = "stop"
-                            elseif idx == 3 then action = "vol-10"
-                            elseif idx == 4 then action = "vol-1"
-                            elseif idx == 5 then action = "vol+1"
-                            elseif idx == 6 then action = "vol+10"
-                            end
-                        end
-
-                        if action == "playpause" then
-                            state.paused = not state.paused
-                            os.queueEvent("video_control")
-                        elseif action == "stop" then
-                            state.stopRequested = true
-                            os.queueEvent("video_control")
-                        elseif action == "vol-1" then adjustVolume(-0.01)
-                        elseif action == "vol+1" then adjustVolume(0.01)
-                        elseif action == "vol-10" then adjustVolume(-0.10)
-                        elseif action == "vol+10" then adjustVolume(0.10)
-                        end
-                    end
-                end
-            )
-        end)
-
+    local function stopSpeakers()
         for _, speaker in ipairs(speakers) do pcall(speaker.stop) end
-        resetPalette(mon)
+    end
 
-        if not playOk then
-            -- Ctrl+T raises "Terminated" through os.pullEvent -- pcall would
-            -- otherwise silently swallow that and let playback continue, so
-            -- Ctrl+T would appear to do nothing while a video is playing.
-            -- Re-raise it so termination actually propagates and stops the
-            -- whole program, same as it would anywhere else.
-            if tostring(playErr):find("Terminated") then
-                mon.setBackgroundColor(colors.black)
-                mon.setTextColor(colors.white)
-                mon.clear()
-                error(playErr, 0)
+    -- Streams entry.audio start to finish, independently of video decoding.
+    local function streamAudio()
+        if not hasSeparateAudio then return end
+        local dfpwm = require("cc.audio.dfpwm")
+        local BLOCK = 16 * 1024
+        -- Position actually HEARD. Audio plays at exactly real time, so within
+        -- one uninterrupted span the wall clock is the truth; a pause simply
+        -- ends the span and starts a new one. Counting bytes handed to
+        -- playAudio does not work: it returns when a block is accepted, not
+        -- when it is heard, and the speaker takes several ahead.
+        local posSec = 0
+
+        for _, url in ipairs(entry.audio) do
+            if state.stopRequested or videoDone then break end
+
+            local partStartSec = posSec
+            local reopenAtByte = 0
+            local partFinished = false
+
+            while not partFinished and not state.stopRequested and not videoDone do
+                -- Resuming re-requests from the byte the listener actually got
+                -- to, so nothing is skipped or repeated across a pause.
+                local headers = nil
+                if reopenAtByte > 0 then
+                    headers = { Range = ("bytes=%d-"):format(reopenAtByte) }
+                end
+                local response = http.get(url, headers, true)
+                if not response then break end
+
+                local decoder = dfpwm.make_decoder()
+                local spanStartMs = os.epoch("utc")
+                local spanStartSec = partStartSec + reopenAtByte / DFPWM_BYTES_PER_SECOND
+                posSec = spanStartSec
+                local pausedHere = false
+
+                while not state.stopRequested and not videoDone do
+                    if state.paused then pausedHere = true break end
+
+                    local data = response.read(BLOCK)
+                    if not data then partFinished = true break end
+
+                    local buffer = decoder(data)
+                    local funcs = {}
+                    for _, speaker in ipairs(speakers) do
+                        funcs[#funcs + 1] = function()
+                            while not state.stopRequested and not state.paused do
+                                if speaker.playAudio(buffer, state.volume) then return end
+                                -- Wakes on video_control too. Waiting only on
+                                -- speaker_audio_empty meant a pause went
+                                -- unnoticed until the speaker had played out
+                                -- everything it held -- felt as pause simply
+                                -- not working for several seconds.
+                                repeat
+                                    local ev = os.pullEvent()
+                                until ev == "speaker_audio_empty" or ev == "video_control"
+                                    or state.paused or state.stopRequested
+                            end
+                        end
+                    end
+                    if #funcs > 0 then parallel.waitForAll(table.unpack(funcs)) end
+                    if state.paused then pausedHere = true break end
+
+                    posSec = spanStartSec + (os.epoch("utc") - spanStartMs) / 1000
+                end
+
+                response.close()
+
+                if pausedHere then
+                    -- Pausing must DISCARD what the speakers hold, not merely
+                    -- stop feeding them: playAudio queues seconds ahead, so
+                    -- otherwise the sound carries on after the picture stops.
+                    stopSpeakers()
+                    posSec = spanStartSec + (os.epoch("utc") - spanStartMs) / 1000
+                    reopenAtByte = math.max(0,
+                        math.floor((posSec - partStartSec) * DFPWM_BYTES_PER_SECOND))
+                    while state.paused and not state.stopRequested do
+                        os.pullEvent("video_control")
+                    end
+                end
             end
-            drawLoading(mon, w, h, "Playback error: " .. tostring(playErr))
-            os.sleep(2)
-            result = "done"
-            break
-        end
-
-        if state.stopRequested then
-            result = "stopped"
-            break
         end
     end
+
+    local function videoLoop()
+        for chunkIndex, url in ipairs(entry.chunks) do
+            if state.stopRequested then break end
+
+            drawLoading(mon, w, h, ("Loading %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
+
+            local file = fetchChunkToMemory(url)
+            drawLoading(mon, w, h, ("Decoding %s (part %d/%d)..."):format(entry.name, chunkIndex, #entry.chunks))
+
+            local buttons = buildButtonLayout(w, h, math.floor(w / 2) + 1)
+
+            local function saveVolume()
+                savedSettings.videoVolume = state.volume
+                settings.save(savedSettings)
+            end
+            local function adjustVolume(deltaFraction)
+                local step = deltaFraction * state.maxVolume
+                state.volume = math.max(0, math.min(state.maxVolume, state.volume + step))
+                saveVolume()
+            end
+
+            -- Streaming decode+play: decodeModule.decode() calls these
+            -- handlers inline as it reads through the chunk, one record at a
+            -- time (see vendor/32vid-decode.lua's header comment for why this
+            -- replaced the old decode-everything-into-arrays-first approach).
+            -- Video frames are paced to fps and drawn here; audio chunks are
+            -- fired at every speaker with no wait/retry, exactly like
+            -- sanjuuni's own reference player -- the video pacing (interleaved
+            -- with audio records in file order) is what keeps playback roughly
+            -- real-time, not a separate acknowledgment-based audio clock.
+            local fps = 10
+            local frameStart = os.epoch("utc")
+            local lastPalette, lastRows = {}, {}
+            local framesPlayed = 0
+
+            -- A plain Lua table, not os.queueEvent, hands audio chunks to the
+            -- dispatcher branch below. A previous version used
+            -- os.queueEvent("kx_audio_chunk", chunk) for this -- CC's event
+            -- queue is a single GLOBAL queue with no concept of "this chunk's
+            -- playback session", so when parallel.waitForAny tore the
+            -- dispatcher coroutine down the instant decoding finished (to move
+            -- on to the next .32vid chunk), any audio events still undelivered
+            -- at that moment didn't just get dropped -- they SURVIVED in the
+            -- queue and got picked up by the NEXT chunk's freshly-scheduled
+            -- dispatcher instead, playing stale leftover audio from the
+            -- previous chunk mixed in with the new one right at the boundary.
+            -- Confirmed in-game as exactly this: garbled/distorted sound right
+            -- when moving to the second chunk. A local table is naturally
+            -- scoped to just this chunk's playback call, and decodeFinished +
+            -- switching to parallel.waitForAll below (instead of waitForAny)
+            -- means this dispatcher now runs until its queue is FULLY drained
+            -- before the loop moves on, instead of being cut off mid-queue.
+            local audioQueue = {}
+            local audioQueueTail = 0
+            local decodeFinished = false
+
+            local handlers = {
+                shouldStop = function() return state.stopRequested end,
+                onHeader = function(_, _, headerFps)
+                    fps = headerFps
+                    frameStart = os.epoch("utc")
+                end,
+                onVideoFrame = function(frame, frameIndex)
+                    while state.paused and not state.stopRequested do
+                        os.pullEvent("video_control")
+                        frameStart = os.epoch("utc") - (frameIndex - 1) / fps * 1000 -- resume timing cleanly
+                    end
+                    if state.stopRequested then return end
+
+                    drawFrame(mon, frame, lastPalette, lastRows)
+                    state.elapsedSec = cumulativeSec + (frameIndex - 1) / fps
+                    drawControls(mon, w, h, state, entry.durationSec or 0, buttons)
+                    framesPlayed = frameIndex
+
+                    while os.epoch("utc") < frameStart + (frameIndex + 1) / fps * 1000 do
+                        os.sleep(1 / fps)
+                        if state.stopRequested then break end
+                    end
+                end,
+                onAudioChunk = function(chunk)
+                    -- Just enqueue and a wake ping -- decode/video pacing must
+                    -- never block on a speaker. A previous version called
+                    -- speaker.playAudio straight from here with no wait
+                    -- ("fire-and-forget", like sanjuuni's own reference player)
+                    -- and confirmed in-game that broke multi-speaker sync badly
+                    -- ("not every speaker sound the same and gets delayed...
+                    -- completely shatted system with speakers") -- the
+                    -- reference player is written for ONE local speaker, not
+                    -- dozens of networked ones, so its no-wait/no-retry
+                    -- assumption doesn't hold here. The separate
+                    -- audio-dispatcher branch below restores the known-good
+                    -- synchronized per-speaker ack+timeout dispatch, decoupled
+                    -- from this decode/video loop so a slow speaker still can't
+                    -- stall video pacing either.
+                    if state.stopRequested then return end
+                    audioQueueTail = audioQueueTail + 1
+                    audioQueue[audioQueueTail] = chunk
+                    os.queueEvent("kx_audio_wake")
+                end,
+            }
+
+            local playOk, playErr = pcall(function()
+                parallel.waitForAll(
+                    function()
+                        decodeModule.decode(file, handlers)
+                        cumulativeSec = cumulativeSec + framesPlayed / fps
+                        decodeFinished = true
+                        os.queueEvent("kx_audio_wake") -- nudge the dispatcher in case it's idle-waiting
+                    end,
+                    function() -- audio dispatcher: drains the queue, fans each chunk out
+                        -- Nothing feeds this queue when audio is a separate
+                        -- stream, so it would sit blocked on an event that never
+                        -- comes until decoding happens to end.
+                        if hasSeparateAudio then return end
+                        -- to every networked speaker in sync (waits for each speaker's own
+                        -- speaker_audio_empty ack, with a 3s per-speaker timeout so one dead
+                        -- speaker among many can't stall the others indefinitely). Keeps
+                        -- running until decode is done AND the queue is fully empty, so
+                        -- nothing from this chunk is ever cut short or bleeds into the next.
+                        local head = 1
+                        while true do
+                            while head > audioQueueTail do
+                                if state.stopRequested or decodeFinished then return end
+                                os.pullEvent("kx_audio_wake")
+                            end
+                            local chunk = audioQueue[head]
+                            audioQueue[head] = nil
+                            head = head + 1
+                            if chunk and not state.stopRequested and #speakers > 0 then
+                                local funcs = {}
+                                for _, speaker in ipairs(speakers) do
+                                    funcs[#funcs + 1] = function()
+                                        while not state.stopRequested and not speaker.playAudio(chunk, state.volume) do
+                                            local timerId = os.startTimer(3)
+                                            local gaveUp = false
+                                            repeat
+                                                local ev2, a = os.pullEvent()
+                                                if ev2 == "speaker_audio_empty" and a == peripheral.getName(speaker) then
+                                                    break
+                                                elseif ev2 == "timer" and a == timerId then
+                                                    gaveUp = true
+                                                    break
+                                                end
+                                            until state.stopRequested
+                                            if gaveUp or state.stopRequested then break end
+                                        end
+                                    end
+                                end
+                                parallel.waitForAll(table.unpack(funcs))
+                            end
+                        end
+                    end,
+                    function() -- input handling: keyboard (at the Computer) and touch (at the monitor)
+                        while not state.stopRequested and not decodeFinished do
+                            local event, a, b, c = os.pullEvent()
+                            local action = nil
+
+                            if event == "key" then
+                                if a == keys.q then
+                                    -- Global quit hotkey (Computer's own keyboard
+                                    -- only, not the monitor) -- video playback
+                                    -- runs its own raw event loop instead of
+                                    -- Basalt's run(), so hub.lua's schedule-based
+                                    -- Q watcher never gets resumed while a video
+                                    -- is playing. Raising "Terminated" here reuses
+                                    -- the exact propagation path plain os.pullEvent
+                                    -- already uses for a real Ctrl+T (this same
+                                    -- pcall boundary below already checks for and
+                                    -- re-raises that string), so it exits exactly
+                                    -- the same way, proven already to work.
+                                    _G.KOMANDA_TERMINATED = true
+                                    error("Terminated", 0)
+                                elseif a == keys.space then action = "playpause"
+                                elseif a == keys.s then action = "stop"
+                                elseif a == keys.left then action = "vol-1"
+                                elseif a == keys.right then action = "vol+1"
+                                end
+                            elseif event == "monitor_touch" then
+                                local idx = hitTestButton(buttons, b, c)
+                                if idx == 1 then action = "playpause"
+                                elseif idx == 2 then action = "stop"
+                                elseif idx == 3 then action = "vol-10"
+                                elseif idx == 4 then action = "vol-1"
+                                elseif idx == 5 then action = "vol+1"
+                                elseif idx == 6 then action = "vol+10"
+                                end
+                            end
+
+                            if action == "playpause" then
+                                state.paused = not state.paused
+                                os.queueEvent("video_control")
+                            elseif action == "stop" then
+                                state.stopRequested = true
+                                os.queueEvent("video_control")
+                            elseif action == "vol-1" then adjustVolume(-0.01)
+                            elseif action == "vol+1" then adjustVolume(0.01)
+                            elseif action == "vol-10" then adjustVolume(-0.10)
+                            elseif action == "vol+10" then adjustVolume(0.10)
+                            end
+                        end
+                    end
+                )
+            end)
+
+            -- NOT stopped when audio is a separate stream: those speakers are
+            -- mid-way through the continuous soundtrack, and stopping them here
+            -- would cut it at every chunk boundary (and can strand the audio
+            -- coroutine waiting for a speaker_audio_empty that never arrives,
+            -- because the buffer was discarded rather than played out).
+            if not hasSeparateAudio then
+                stopSpeakers()
+            end
+            resetPalette(mon)
+
+            if not playOk then
+                -- Ctrl+T raises "Terminated" through os.pullEvent -- pcall would
+                -- otherwise silently swallow that and let playback continue, so
+                -- Ctrl+T would appear to do nothing while a video is playing.
+                -- Re-raise it so termination actually propagates and stops the
+                -- whole program, same as it would anywhere else.
+                if tostring(playErr):find("Terminated") then
+                    mon.setBackgroundColor(colors.black)
+                    mon.setTextColor(colors.white)
+                    mon.clear()
+                    error(playErr, 0)
+                end
+                drawLoading(mon, w, h, "Playback error: " .. tostring(playErr))
+                os.sleep(2)
+                result = "done"
+                break
+            end
+
+            if state.stopRequested then
+                result = "stopped"
+                break
+            end
+        end
+        videoDone = true
+    end
+
+    -- The chunk loop and the audio stream run alongside each other for the
+    -- whole video. entry.audio covers the ENTIRE soundtrack, so starting it
+    -- inside a chunk's own parallel block deadlocks: that block waits for
+    -- every branch, so the picture would freeze at the end of chunk one until
+    -- the whole track finished. (Learned the hard way on the wall.)
+    --
+    -- pcall'd so the speakers are silenced even when playback exits by error,
+    -- notably Ctrl+T raising "Terminated".
+    local ranOk, runErr = pcall(parallel.waitForAll, videoLoop, streamAudio)
+
+    -- Stopping has to DISCARD what the speakers hold, not just stop feeding
+    -- them, or the soundtrack plays on over whatever screen comes back.
+    stopSpeakers()
 
     mon.setBackgroundColor(colors.black)
     mon.setTextColor(colors.white)
     mon.clear()
+    if not ranOk then error(runErr, 0) end
     return result
 end
 
