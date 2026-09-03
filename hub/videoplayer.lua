@@ -243,6 +243,10 @@ function M.play(mon, speakers, entry, config)
         if not hasSeparateAudio then return end
         local dfpwm = require("cc.audio.dfpwm")
         local BLOCK = 16 * 1024
+        -- How much audio may sit unheard in the speakers. Deep enough to ride
+        -- out a server hiccup without a gap; the picture paces to the sound,
+        -- so buffer depth never costs sync.
+        local BUFFER_TARGET_SEC = 3.0
         -- Position actually HEARD. Audio plays at exactly real time, so within
         -- one uninterrupted span the wall clock is the truth; a pause simply
         -- ends the span and starts a new one. Counting bytes handed to
@@ -597,7 +601,13 @@ function M.play(mon, speakers, entry, config)
     --
     -- pcall'd so the speakers are silenced even when playback exits by error,
     -- notably Ctrl+T raising "Terminated".
-    local ranOk, runErr = pcall(parallel.waitForAll, videoLoop, streamAudio)
+    -- The audio branch is individually pcall'd. An error anywhere inside
+    -- waitForAll propagates out of ALL of it, so without this a transient
+    -- http failure while fetching audio ended the video outright -- audio is
+    -- a convenience, the picture is the point.
+    local ranOk, runErr = pcall(parallel.waitForAll,
+        videoLoop,
+        function() pcall(streamAudio) end)
 
     -- Stopping has to DISCARD what the speakers hold, not just stop feeding
     -- them, or the soundtrack plays on over whatever screen comes back.
@@ -606,7 +616,15 @@ function M.play(mon, speakers, entry, config)
     mon.setBackgroundColor(colors.black)
     mon.setTextColor(colors.white)
     mon.clear()
-    if not ranOk then error(runErr, 0) end
+    if not ranOk then
+        -- Ctrl+T still has to unwind everywhere, as it would normally.
+        -- Anything else is reported and control returns to the menu: one
+        -- failed video is not a reason to take the whole hub down.
+        if tostring(runErr):find("Terminated") then error(runErr, 0) end
+        drawLoading(mon, w, h, "Playback error: " .. tostring(runErr))
+        os.sleep(2)
+        return "done"
+    end
     return result
 end
 
